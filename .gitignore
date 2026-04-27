@@ -73,3 +73,17 @@ tests/
 # TacSL sensor
 **/tactile_record/*
 **/gelsight_r15_data/*
+
+
+# Blocca file pesanti specifici
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.onnx
+*.usd
+*.usda
+*.usdc
+*.usdz
+*.mp4
+*.hdf5

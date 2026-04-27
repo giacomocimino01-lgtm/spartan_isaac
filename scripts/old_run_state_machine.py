@@ -1,11 +1,11 @@
-"""Script per testare la Macchina a Stati sul dVRK usando il Manager-based workflow con Reinforcement Learning."""
+"""Script per testare la Macchina a Stati sul dVRK usando il Manager-based workflow."""
 import argparse
 import threading
 
 # 1. SETUP INIZIALE DI ISAAC SIM (Deve avvenire prima degli altri import)
 from isaaclab.app import AppLauncher
 
-parser = argparse.ArgumentParser(description="Macchina a stati per il Peg and Ring con RL.")
+parser = argparse.ArgumentParser(description="Macchina a stati per il Peg and Ring.")
 parser.add_argument("--num_envs", type=int, default=1, help="Numero di ambienti da spawnare in parallelo.")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
@@ -22,48 +22,21 @@ from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.markers import VisualizationMarkers
 from isaaclab.markers.config import FRAME_MARKER_CFG
 
-import gymnasium as gym
-from gymnasium import spaces
-from collections import deque
-
-import torchvision.models as models
-import torch.nn as nn
-import torchvision.transforms as T
-
 # Importa la configurazione del tuo ambiente
 from m_dVrk.tasks.manager_based.m_dvrk.m_dvrk_env_cfg import MDvrkEnvCfg 
 
-VERB_MAP = {0: "reach", 1: "grasp", 2: "release", 3: "idle"}
-TARGET_MAP = {
-    0: "ring_red", 1: "ring_yellow", 2: "ring_green", 3: "ring_blue",
-    4: "peg_red", 5: "peg_yellow", 6: "peg_green", 7: "peg_blue",
-    8: "peg_gray", 9: "None"
-}
-
 # ==========================================
-# CLASSE XIRL: CLONE DELLA RETE PRE-TRAINATA
-# ==========================================
-class XIRLResnet18(nn.Module):
-    def __init__(self, embedding_size=32):
-        super().__init__()
-        # Carica una ResNet18 vuota
-        self.model = models.resnet18(weights=None)
-        # Sostituisce l'ultimo strato per avere 32 output (come da tuo config XIRL)
-        num_ftrs = self.model.fc.in_features
-        self.model.fc = nn.Linear(num_ftrs, embedding_size)
-
-    def forward(self, x):
-        return self.model(x)
-
-# ==========================================
-# CLASSE 1: LA MACCHINA A STATI (Il Cervello Mid-Level)
+# CLASSE 1: LA MACCHINA A STATI (Il Cervello)
 # ==========================================
 class SPARTANStateMachine:
-    Z_TABLE = 0.72              
-    SAFE_Z_OFFSET = 0.03        
-    GRASP_Z_OFFSET = 0.005      
-    TOLERANCE_XY = 0.001        
-    TOLERANCE_Z = 0.007         
+    # --- COSTANTI DI CONFIGURAZIONE ---
+    Z_TABLE = 0.72              # Altezza in cui l'anello riposa sulla basetta
+    SAFE_Z_OFFSET = 0.03        # Altezza di sicurezza per sorvolare i pioli (3 cm)
+    GRASP_Z_OFFSET = 0.005      # Offset di discesa per afferrare l'anello
+    
+    # NUOVE SOGLIE DISACCOPPIATE (Cilindro di tolleranza)
+    TOLERANCE_XY = 0.001        # Tolleranza radiale strettissima (2 mm) per centrare il buco
+    TOLERANCE_Z = 0.007         # Tolleranza verticale più rilassata (6 mm) per l'errore a regime
 
     def __init__(self, env):
         self.env = env
@@ -77,6 +50,7 @@ class SPARTANStateMachine:
             "right_arm": torch.zeros((env.num_envs, 3), device=self.device),
             "left_arm": torch.zeros((env.num_envs, 3), device=self.device)
         }
+
         self.current_gripper_state = {
             "right_arm": 1.0, 
             "left_arm": 1.0
@@ -84,19 +58,30 @@ class SPARTANStateMachine:
         self.attached_target = {"right_arm": None, "left_arm": None}
         self.last_target = {"right_arm": None, "left_arm": None}
 
+        self.peg_inventory = {
+            "peg_red": 0, "peg_yellow": 0, "peg_green": 0, 
+            "peg_blue": 0, "peg_gray": 0, "peg_gray1": 0
+        }
+        self.RING_THICKNESS = 0.004 # 4 millimetri per anello (2 reali + margine di sicurezza visivo)
+
     def set_new_triplet(self, verb: str, subject: str, target: str):
         new_cmd = {"verb": verb, "subject": subject, "target": target}
         
         if self.current_triplet[subject] == new_cmd:
             return
             
-        print(f"[SM] INTERRUZIONE/NUOVO COMANDO: <{verb}, {subject}, {target}>")
+        print(f"[SM] Ricevuto nuovo comando: <{verb}, {subject}, {target}>")
         self.current_triplet[subject] = new_cmd
-        self.sub_state[subject] = "COMPUTE_TARGET_POS" 
+        self.sub_state[subject] = "COMPUTE_TARGET_POS"
         self.step_counter[subject] = 0
 
     def get_target_coordinates(self, target_name: str, subject: str):
+        """Trova le coordinate globali vettorizzate compensate in base al braccio."""
+        
+        # Il Segno: +1.0 per il destro, -1.0 per il sinistro
         segno = 1.0 if subject == "right_arm" else -1.0
+        
+        # Compensazione speculare!
         vettore_compensazione = torch.tensor([[-0.005 * segno, 0.0, 0.0]], device=self.device)
 
         if target_name in self.env.scene.keys():
@@ -110,15 +95,18 @@ class SPARTANStateMachine:
             else:
                 return torch.tensor([[0.5, 0.0, 0.5]], device=self.device).repeat(self.env.num_envs, 1)
         else:
+            print(f"[ERRORE] Target '{target_name}' non trovato nella scena!")
             return torch.tensor([[0.5, 0.0, 0.5]], device=self.device).repeat(self.env.num_envs, 1)
         
     def get_action(self):
+        """Calcola e restituisce il tensore delle azioni per entrambi i bracci (MODALITÀ RELATIVA)."""
         action_right = torch.zeros((self.env.num_envs, 6), device=self.device)
         action_left = torch.zeros((self.env.num_envs, 6), device=self.device)
         
         gripper_right = torch.full((self.env.num_envs, 2), self.current_gripper_state["right_arm"], device=self.device)
         gripper_left = torch.full((self.env.num_envs, 2), self.current_gripper_state["left_arm"], device=self.device)
 
+        # --- LOGICA DI IDLE (Relativa) ---
         for arm_name in ["right_arm", "left_arm"]:
             scene_name = "robot_right" if arm_name == "right_arm" else "robot_left"
             robot = self.env.scene[scene_name]
@@ -137,6 +125,7 @@ class SPARTANStateMachine:
             if arm_name == "right_arm": action_right[:] = idle_action
             if arm_name == "left_arm": action_left[:] = idle_action
 
+        # --- LOGICA ATTIVA INDIPENDENTE (Relativa) ---
         for subject in ["right_arm", "left_arm"]:
             if self.current_triplet[subject] is not None and self.sub_state[subject] != "IDLE":
                 verb = self.current_triplet[subject]["verb"]
@@ -150,16 +139,20 @@ class SPARTANStateMachine:
                 body_idx = robot.find_bodies("psm_tool_tip_link")[0][0]
                 tip_pos_w = robot.data.body_pos_w[:, body_idx]
 
+                # === AZIONE: REACH ===
                 if verb == "reach":
                     if self.sub_state[subject] == "COMPUTE_TARGET_POS":
                         self.sub_state[subject] = "APPROACH_ABOVE"
                         self.step_counter[subject] = 0
+
                     elif self.sub_state[subject] == "APPROACH_ABOVE":
                         self.target_pos[subject] = self.get_target_coordinates(self.current_triplet[subject]["target"], subject)
                         destinazione = self.target_pos[subject] + torch.tensor([[0.0, 0.0, self.SAFE_Z_OFFSET]], device=self.device)
                         active_arm[:, 0:3] = destinazione - tip_pos_w
+                        
                         if self.step_counter[subject] > 150:
                             self.sub_state[subject] = "DESCEND"
+
                     elif self.sub_state[subject] == "DESCEND":
                         self.target_pos[subject] = self.get_target_coordinates(self.current_triplet[subject]["target"], subject)
                         destinazione_reale = self.target_pos[subject] + torch.tensor([[0.0, 0.0, self.GRASP_Z_OFFSET]], device=self.device)
@@ -170,23 +163,29 @@ class SPARTANStateMachine:
                         distanza_z = torch.abs(destinazione_reale[:, 2] - tip_pos_w[:, 2])
                         
                         if distanza_xy[0] < self.TOLERANCE_XY and distanza_z[0] < self.TOLERANCE_Z:
+                            print(f"[SM {subject}] Target agganciato! Err_XY: {distanza_xy[0].item():.4f}m | Err_Z: {distanza_z[0].item():.4f}m")
                             self.sub_state[subject] = "SETTLE"
                             self.step_counter[subject] = 0
+
                     elif self.sub_state[subject] == "SETTLE":
                         destinazione_reale = self.target_pos[subject] + torch.tensor([[0.0, 0.0, self.GRASP_Z_OFFSET]], device=self.device)
                         active_arm[:, 0:3] = destinazione_reale - tip_pos_w
+                        
                         if self.step_counter[subject] > 15:
                             self.last_target[subject] = self.current_triplet[subject]["target"]
                             self.target_pos[subject] = destinazione_reale
                             self.sub_state[subject] = "IDLE"
 
+                # === AZIONE: GRASP ===
                 elif verb == "grasp":
                     if self.sub_state[subject] == "COMPUTE_TARGET_POS":
                         self.sub_state[subject] = "CLOSE_GRIPPER"
                         self.step_counter[subject] = 0
+
                     elif self.sub_state[subject] == "CLOSE_GRIPPER":
                         self.current_gripper_state[subject] = -1.0
                         active_gripper[:] = self.current_gripper_state[subject]
+                        
                         destinazione = self.target_pos[subject]
                         active_arm[:, 0:3] = destinazione - tip_pos_w
                         
@@ -196,22 +195,27 @@ class SPARTANStateMachine:
                             
                             altro_braccio = "left_arm" if subject == "right_arm" else "right_arm"
                             if self.attached_target[altro_braccio] == oggetto_da_prendere:
+                                print(f"[SM] SCAMBIO! Il {altro_braccio} rilascia {oggetto_da_prendere} al {subject}.")
                                 self.attached_target[altro_braccio] = None
                                 self.current_gripper_state[altro_braccio] = 1.0 
                                 
                             self.sub_state[subject] = "LIFT_UP"
+                    
                     elif self.sub_state[subject] == "LIFT_UP":
                         active_gripper[:] = self.current_gripper_state[subject]
                         destinazione = self.target_pos[subject] + torch.tensor([[0.0, 0.0, self.SAFE_Z_OFFSET]], device=self.device)
                         active_arm[:, 0:3] = destinazione - tip_pos_w
+                        
                         if self.step_counter[subject] > 250:
                             self.target_pos[subject] = destinazione
                             self.sub_state[subject] = "IDLE"
 
+                # === AZIONE: RELEASE ===
                 elif verb == "release":
                     if self.sub_state[subject] == "COMPUTE_TARGET_POS":
                         self.sub_state[subject] = "APPROACH_PEG"
                         self.step_counter[subject] = 0
+
                     elif self.sub_state[subject] == "APPROACH_PEG":
                         self.current_gripper_state[subject] = -1.0 
                         active_gripper[:] = self.current_gripper_state[subject]
@@ -224,6 +228,7 @@ class SPARTANStateMachine:
                             target_pos_w = self.get_target_coordinates(target_peg, subject)
                             destinazione = target_pos_w + torch.tensor([[0.0, 0.0, self.SAFE_Z_OFFSET]], device=self.device)
                             active_arm[:, 0:3] = destinazione - tip_pos_w
+                            
                             if self.step_counter[subject] > 120:
                                 self.sub_state[subject] = "DESCEND_TO_PEG"
                                 self.step_counter[subject] = 0
@@ -232,6 +237,7 @@ class SPARTANStateMachine:
                             if self.step_counter[subject] > 50:
                                 self.sub_state[subject] = "OPEN_GRIPPER"
                                 self.step_counter[subject] = 0
+
                     elif self.sub_state[subject] == "DESCEND_TO_PEG":
                         self.current_gripper_state[subject] = -1.0 
                         active_gripper[:] = self.current_gripper_state[subject]
@@ -242,12 +248,17 @@ class SPARTANStateMachine:
                         
                         target_pos_w = self.get_target_coordinates(target_peg, subject)
                         destinazione = target_pos_w.clone()
-                        destinazione[:, 2] = self.Z_TABLE
+                        
+                        num_anelli_presenti = self.peg_inventory.get(target_peg, 0)
+                        altezza_pila = self.Z_TABLE + (num_anelli_presenti * self.RING_THICKNESS)
+                        destinazione[:, 2] = altezza_pila
+                        
                         active_arm[:, 0:3] = destinazione - tip_pos_w
                         
                         if self.step_counter[subject] > 120:
                             self.sub_state[subject] = "OPEN_GRIPPER"
                             self.step_counter[subject] = 0
+
                     elif self.sub_state[subject] == "OPEN_GRIPPER":
                         self.current_gripper_state[subject] = 1.0 
                         active_gripper[:] = self.current_gripper_state[subject]
@@ -259,11 +270,16 @@ class SPARTANStateMachine:
                         if target_peg is not None:
                             target_pos_w = self.get_target_coordinates(target_peg, subject)
                             destinazione = target_pos_w.clone()
-                            destinazione[:, 2] = self.Z_TABLE
+                            
+                            num_anelli_presenti = self.peg_inventory.get(target_peg, 0)
+                            altezza_pila = self.Z_TABLE + (num_anelli_presenti * self.RING_THICKNESS)
+                            destinazione[:, 2] = altezza_pila
+                            
                             active_arm[:, 0:3] = destinazione - tip_pos_w
                         else:
                             active_arm[:, 0:3] = self.target_pos[subject] - tip_pos_w
 
+                        # Snap Release Magico
                         if self.step_counter[subject] == 10:
                             obj_name = self.attached_target[subject]
                             if target_peg is not None and obj_name is not None:
@@ -277,7 +293,13 @@ class SPARTANStateMachine:
                                 elif hasattr(peg_entity, "data"):
                                     new_state[:, 0:3] = peg_entity.data.root_pos_w.clone()
                                     
-                                new_state[:, 2] = self.Z_TABLE
+                                # FIX PILA DI ANELLI (STACKING)
+                                num_anelli_presenti = self.peg_inventory.get(target_peg, 0)
+                                nuova_z = self.Z_TABLE + (num_anelli_presenti * self.RING_THICKNESS)
+                                new_state[:, 2] = nuova_z
+                                
+                                self.peg_inventory[target_peg] = num_anelli_presenti + 1
+                                
                                 new_state[:, 3:7] = torch.tensor([[1.0, 0.0, 0.0, 0.0]], device=self.device)
                                 new_state[:, 7:13] = 0.0
                                 ring.write_root_state_to_sim(new_state)
@@ -291,252 +313,158 @@ class SPARTANStateMachine:
                             else:
                                 self.sub_state[subject] = "IDLE"
                             self.step_counter[subject] = 0
-                    elif self.sub_state[subject] == "RETREAT":
-                        self.current_gripper_state[subject] = 1.0
-                        active_gripper[:] = self.current_gripper_state[subject]
-                        
-                        target_cmd = self.current_triplet[subject]["target"]
-                        last_tgt = self.last_target[subject]
-                        target_peg = target_cmd if target_cmd.startswith("peg_") else (last_tgt if str(last_tgt).startswith("peg_") else None)
-                        
-                        if target_peg is not None:
-                             target_pos_w = self.get_target_coordinates(target_peg, subject)
-                             destinazione = target_pos_w + torch.tensor([[0.0, 0.0, 0.10]], device=self.device)
-                             active_arm[:, 0:3] = destinazione - tip_pos_w
 
-                        if self.step_counter[subject] > 100:
-                            if target_peg is not None:
-                                 self.target_pos[subject] = destinazione
-                            self.sub_state[subject] = "IDLE"
+                elif self.sub_state[subject] == "RETREAT":
+                    self.current_gripper_state[subject] = 1.0
+                    active_gripper[:] = self.current_gripper_state[subject]
+                    
+                    target_cmd = self.current_triplet[subject]["target"]
+                    last_tgt = self.last_target[subject]
+                    target_peg = target_cmd if target_cmd.startswith("peg_") else (last_tgt if str(last_tgt).startswith("peg_") else None)
+                    
+                    if target_peg is not None:
+                         target_pos_w = self.get_target_coordinates(target_peg, subject)
+                         destinazione = target_pos_w + torch.tensor([[0.0, 0.0, 0.10]], device=self.device)
+                         active_arm[:, 0:3] = destinazione - tip_pos_w
+
+                    if self.step_counter[subject] > 100:
+                        if target_peg is not None:
+                             self.target_pos[subject] = destinazione
+                        self.sub_state[subject] = "IDLE"
 
                 self.step_counter[subject] += 1
 
         return torch.cat([action_right, gripper_right, action_left, gripper_left], dim=-1)
 
 # ==========================================
-# CLASSE 1.5: IL WRAPPER PER IL REINFORCEMENT LEARNING
+# CLASSE 2: INTERFACCIA GRAFICA (GUI)
 # ==========================================
-class DVRKVisionHRLWrapper(gym.Env):
-    def __init__(self, isaac_env, state_machine, tcc_model=None):
-        super().__init__()
-        self.env = isaac_env
-        self.sm = state_machine
-        self.tcc_model = tcc_model
-        
-        self.physics_steps_per_rl_step = 10 
-        self.stack_size = 3                 
-        self.emb_dim = 32 # Aggiornato a 32 come da tuo config XIRL
-        
-        self.action_space = spaces.MultiDiscrete([len(VERB_MAP), len(TARGET_MAP), len(VERB_MAP), len(TARGET_MAP)])
-        
-        self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, 
-            shape=(self.stack_size * self.emb_dim,), 
-            dtype=np.float32
-        )
-        self.emb_buffer = deque(maxlen=self.stack_size)
+class StateMachineUI:
+    def __init__(self):
+        self.window = ui.Window("SPARTAN State Machine", width=300, height=350)
+        self.state_labels = {}
+        self.style_active = {"color": 0xFF00FF00, "font_size": 20}  
+        self.style_inactive = {"color": 0xFF888888, "font_size": 16} 
+        self.style_header = {"color": 0xFFFFFFFF, "font_size": 24, "margin_width": 10} 
+        self._build_ui()
 
-        # Trasformazioni per la rete (Resize a 224x224 + Norm come da config XIRL)
-        self.preprocess = T.Compose([
-            T.Resize((224, 224)), 
-            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
+    def _build_ui(self):
+        with self.window.frame:
+            with ui.VStack(spacing=10):
+                ui.Label("VERB ATTUALE (Right Arm):", style=self.style_header)
+                self.verb_label = ui.Label("Nessuno", style={"color": 0xFF00A5FF, "font_size": 20}) 
+                ui.Line(style={"color": 0xFF555555}) 
+                ui.Label("ALBERO DEGLI STATI:", style=self.style_header)
+                
+                all_states = [
+                    "IDLE", "COMPUTE_TARGET_POS", "APPROACH_ABOVE", "DESCEND", "SETTLE",
+                    "CLOSE_GRIPPER", "LIFT_UP", "APPROACH_PEG", "DESCEND_TO_PEG",
+                    "OPEN_GRIPPER", "RETREAT"
+                ]
+                
+                for state in all_states:
+                    with ui.HStack(height=0):
+                        ui.Spacer(width=20) 
+                        label = ui.Label(f"• {state}", style=self.style_inactive)
+                        self.state_labels[state] = label
 
-    def _compute_reward(self, current_emb):
-        if not hasattr(self, 'goal_embedding') or self.goal_embedding is None:
-            return 0.0 
-            
-        if isinstance(current_emb, np.ndarray):
-            current_emb = torch.tensor(current_emb, device=self.env.device)
-        if isinstance(self.goal_embedding, np.ndarray):
-            self.goal_embedding = torch.tensor(self.goal_embedding, device=self.env.device)
+    def update(self, current_verb, current_sub_state):
+        verb_text = str(current_verb).upper() if current_verb else "IN ATTESA..."
+        self.verb_label.text = f"> {verb_text} <"
+        for state_name, label in self.state_labels.items():
+            label.style = self.style_active if state_name == current_sub_state else self.style_inactive
 
-        distanza = torch.norm(current_emb - self.goal_embedding)
-        return -distanza.item()
+# ==========================================
+# VARIABILI E FUNZIONI GLOBALI (Terminale)
+# ==========================================
+trigger_comando = False
+comando_utente = None
+
+def ascolta_terminale():
+    global trigger_comando, comando_utente
+    while True:
+        testo = input("\n[TERMINALE] Scrivi comando (es: 'reach right_arm ring_red'):\n> ")
+        parti = testo.strip().split()
+        if len(parti) == 3:
+            comando_utente = (parti[0], parti[1], parti[2])
+            trigger_comando = True
+        else:
+            print("[TERMINALE] Errore: scrivi 3 parole separate da spazio (Verbo Soggetto Target).")
+
+# ==========================================
+# FUNZIONE PRINCIPALE (Main Loop)
+# ==========================================
+def main():
+    global trigger_comando
     
-    def _get_real_embedding(self):
-        if self.tcc_model is None:
-             return np.random.rand(self.emb_dim).astype(np.float32)
-
-        rgb_data = self.env.scene.sensors["camera"].data.output["rgb"]
-        img_tensor = rgb_data[0] 
-        
-        if img_tensor.shape[-1] == 4:
-            img_tensor = img_tensor[:, :, :3]
-            
-        # [H, W, C] -> [1, C, H, W] e normalizza tra 0 e 1
-        img_input = img_tensor.permute(2, 0, 1).unsqueeze(0).float().to(self.env.device) / 255.0
-        
-        # Applica 224x224 e normalizzazione di ImageNet
-        img_input = self.preprocess(img_input)
-        
-        with torch.no_grad():
-            embedding = self.tcc_model(img_input)
-            
-        return embedding.squeeze().cpu().numpy()
-
-    def reset(self, seed=None, options=None):
-        super().reset(seed=seed)
-        obs, _ = self.env.reset()
-        
-        self.sm.current_triplet = {"right_arm": None, "left_arm": None}
-        self.sm.sub_state = {"right_arm": "IDLE", "left_arm": "IDLE"}
-        self.sm.step_counter = {"right_arm": 0, "left_arm": 0}
-        self.sm.attached_target = {"right_arm": None, "left_arm": None}
-        self.sm.last_target = {"right_arm": None, "left_arm": None}
-        
-        dummy_emb = np.zeros(self.emb_dim, dtype=np.float32)
-        for _ in range(self.stack_size):
-            self.emb_buffer.append(dummy_emb)
-            
-        return self._get_obs(), {}
-
-    def step(self, action):
-        verb_l = VERB_MAP[action[0]]
-        tgt_l  = TARGET_MAP[action[1]]
-        verb_r = VERB_MAP[action[2]]
-        tgt_r  = TARGET_MAP[action[3]]
-        
-        self.sm.set_new_triplet(verb_l, "left_arm", tgt_l)
-        self.sm.set_new_triplet(verb_r, "right_arm", tgt_r)
-        
-        for _ in range(self.physics_steps_per_rl_step):
-            ik_actions = self.sm.get_action()
-            self.env.step(ik_actions)
-            
-            for arm_name, attached_obj in self.sm.attached_target.items():
-                if attached_obj is not None:
-                    ring = self.env.scene[attached_obj]
-                    scene_name = "robot_right" if arm_name == "right_arm" else "robot_left"
-                    robot = self.env.scene[scene_name]
-                    
-                    body_idx = robot.find_bodies("psm_tool_tip_link")[0][0]
-                    tip_pos_w = robot.data.body_pos_w[:, body_idx].clone()
-                    new_state = ring.data.root_state_w.clone()
-                    
-                    segno = 1.0 if arm_name == "right_arm" else -1.0
-                    offset_presa = torch.tensor([0.005 * segno, 0.0, 0.0], device=self.env.device)
-                    
-                    new_state[:, 0:3] = tip_pos_w + offset_presa
-                    new_state[:, 3:7] = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.env.device)
-                    new_state[:, 7:13] = 0.0 
-                    ring.write_root_state_to_sim(new_state)
-
-        real_emb = self._get_real_embedding()
-        self.emb_buffer.append(real_emb)
-        
-        # ==========================================
-        # MOSTRA LA TELECAMERA (Rendering per umani)
-        # ==========================================
-        if "camera" in self.env.scene.sensors:
-            rgb_data = self.env.scene.sensors["camera"].data.output["rgb"]
-            img = rgb_data[0].cpu().numpy().astype(np.uint8)
-            img_bgr = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR) if img.shape[-1] == 4 else cv2.cvtColor(img, cv2.COLOR_RGB2BGR) if img.shape[-1] == 3 else img
-            cv2.imshow("Telecamera dVRK - View IA", img_bgr)
-            cv2.waitKey(1) # Aspetta 1ms per aggiornare la finestra
-        # ==========================================
-
-        reward = self._compute_reward(real_emb)
-        done = False
-        truncated = False # Da implementare un max_steps
-        
-        return self._get_obs(), reward, done, truncated, {}
-
-    def _get_obs(self):
-        return np.concatenate(self.emb_buffer)
-
-# ==========================================
-# TRAINING MAIN
-# ==========================================
-from stable_baselines3 import A2C
-from stable_baselines3.common.vec_env import DummyVecEnv
-import torchvision.io as io
-
-def main_train():
-    print("[INFO] Avvio Setup Isaac Lab...")
+    # Inizializzazione Ambiente
     env_cfg = MDvrkEnvCfg()
     env_cfg.scene.num_envs = args_cli.num_envs
-    isaac_env = ManagerBasedRLEnv(cfg=env_cfg)
+    env = ManagerBasedRLEnv(cfg=env_cfg)
     
-    print("[INFO] Inizializzazione SPARTAN...")
-    state_machine = SPARTANStateMachine(isaac_env)
+    state_machine = SPARTANStateMachine(env)
+    obs, _ = env.reset()
+    
+    # Avvio thread del terminale
+    keyboard_thread = threading.Thread(target=ascolta_terminale, daemon=True)
+    keyboard_thread.start()
 
-    # 1. CARICAMENTO DELLA RETE
-    print("[INFO] Caricamento Pesi XIRL...")
-    device = isaac_env.device
-    tcc_model = XIRLResnet18(embedding_size=32)
-    
-    try:
-        percorso_pesi = "/home/zaza/isaac/m_dVrk/Data/4001.ckpt"
-        checkpoint = torch.load(percorso_pesi, map_location=device)
-        
-        if 'model' in checkpoint:
-            state_dict = checkpoint['model']
-        else:
-            state_dict = checkpoint
-            
-        # Pulisce le chiavi da eventuali prefissi
-        cleaned_state_dict = {}
-        for k, v in state_dict.items():
-            new_key = k.replace('resnet.', '').replace('net.', '').replace('model.', '')
-            cleaned_state_dict[new_key] = v
+    sm_gui = StateMachineUI()
 
-        tcc_model.model.load_state_dict(cleaned_state_dict, strict=False)
-        tcc_model.to(device)
-        tcc_model.eval()
-        print("[INFO] Rete caricata con successo da 4001.ckpt!")
-    except Exception as e:
-        print(f"[ERRORE] Impossibile caricare i pesi: {e}")
-        print("[INFO] Uso la rete non inizializzata per fare test temporanei.")
-        tcc_model.to(device)
-        tcc_model.eval()
+    # Inizializzazione Debug Markers (Terne)
+    marker_cfg = FRAME_MARKER_CFG.replace(prim_path="/Visuals/DebugFrames")
+    marker_cfg.markers["frame"].scale = (0.01, 0.01, 0.01)
+    debug_frames = VisualizationMarkers(marker_cfg)
 
-    print("[INFO] Inizializzazione Wrapper RL...")
-    rl_env = DVRKVisionHRLWrapper(isaac_env, state_machine, tcc_model)
-    
-    # 2. DEFINIZIONE DEL GOAL (IMMAGINE REALE)
-    print("[INFO] Creazione Goal Embedding da Immagine Reale...")
-    try:
-        # Usa il nome corretto del file che hai caricato! 
-        percorso_immagine = "/home/zaza/isaac/m_dVrk/Data/goal.png" 
+    # --- CICLO DI SIMULAZIONE ---
+    while simulation_app.is_running():
         
-        # Legge l'immagine [Canali, Altezza, Larghezza]
-        img_goal = io.read_image(percorso_immagine) 
+        # 2. Ascolto Comandi
+        if trigger_comando and state_machine.sub_state["right_arm"] == "IDLE" and state_machine.sub_state["left_arm"] == "IDLE":
+            if comando_utente is not None:
+                verb, subject, target = comando_utente
+                state_machine.set_new_triplet(verb, subject, target)
+            trigger_comando = False
+
+        # 3. Step Fisico
+        actions = state_machine.get_action()
+        obs, rewards, dones, _, _ = env.step(actions)
+
+        # 4. Rendering Camera OpenCV
+        if "camera" in env.scene.sensors:
+            rgb_data = env.scene.sensors["camera"].data.output["rgb"]
+            img = rgb_data[0].cpu().numpy().astype(np.uint8)
+            img_bgr = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR) if img.shape[-1] == 4 else cv2.cvtColor(img, cv2.COLOR_RGB2BGR) if img.shape[-1] == 3 else img
+            cv2.imshow("Telecamera dVRK - View", img_bgr)
+            cv2.waitKey(1)  
+
+        # 5. Snap Grasp Cinematico (Forzatura posizione in mano)
+        for arm_name, attached_obj in state_machine.attached_target.items():
+            if attached_obj is not None:
+                ring = env.scene[attached_obj]
+                scene_name = "robot_right" if arm_name == "right_arm" else "robot_left"
+                robot = env.scene[scene_name]
+                
+                body_idx = robot.find_bodies("psm_tool_tip_link")[0][0]
+                tip_pos_w = robot.data.body_pos_w[:, body_idx].clone()
+
+                new_state = ring.data.root_state_w.clone()
+                
+                # OFFSET REALISTICO SPECULARE
+                segno = 1.0 if arm_name == "right_arm" else -1.0
+                offset_presa = torch.tensor([0.005 * segno, 0.0, 0.0], device=env.device)
+                
+                new_state[:, 0:3] = tip_pos_w + offset_presa
+                new_state[:, 3:7] = torch.tensor([1.0, 0.0, 0.0, 0.0], device=env.device)
+                new_state[:, 7:13] = 0.0 
+                ring.write_root_state_to_sim(new_state)
         
-        # Se l'immagine ha 4 canali (RGBA, tipico degli screenshot PNG), togliamo l'Alpha
-        if img_goal.shape[0] == 4:
-            img_goal = img_goal[:3, :, :]
-            
-        # [C, H, W] -> [1, C, H, W] (Batch 1) e normalizza tra 0 e 1
-        img_goal = img_goal.unsqueeze(0).float().to(device) / 255.0
-        
-        # Applica 224x224 e normalizzazione
-        preprocess = T.Compose([
-            T.Resize((224, 224)), 
-            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
-        img_goal_processed = preprocess(img_goal)
-        
-        # Estrai il VERO embedding obiettivo!
-        with torch.no_grad():
-            rl_env.goal_embedding = tcc_model(img_goal_processed).squeeze()
-            
-        print("[INFO] Goal embedding reale generato con successo! 🎉")
-        
-    except Exception as e:
-        print(f"[ERRORE] Impossibile caricare l'immagine goal: {e}")
-        print("[INFO] Uso Goal Embedding fittizio (zeri).")
-        rl_env.goal_embedding = torch.zeros(32, device=device) 
-    
-    # 3. AVVIO STABLE BASELINES
-    print("[INFO] Wrap con SB3 e avvio Addestramento A2C...")
-    
-    vec_env = DummyVecEnv([lambda: rl_env])
-    
-    # Usa device="cpu" per evitare colli di bottiglia tra XIRL (su GPU) e la piccola MlpPolicy 
-    model = A2C("MlpPolicy", vec_env, verbose=1, device="cpu")
-    model.learn(total_timesteps=100_000)
+        # 6. Aggiornamento GUI (Mostriamo il braccio destro come riferimento per non sdoppiare la UI)
+        cmd_dx = state_machine.current_triplet["right_arm"]
+        verb = cmd_dx["verb"] if cmd_dx is not None else None
+        stato_dx = state_machine.sub_state["right_arm"]
+        sm_gui.update(current_verb=verb, current_sub_state=stato_dx)
 
 if __name__ == "__main__":
-    main_train()
+    main()
     simulation_app.close()
