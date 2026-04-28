@@ -166,6 +166,14 @@ class PegRingSceneCfg(InteractiveSceneCfg):
     robot_left.init_state.pos = (0.5, -0.15, 0.8)
     #robot_left.init_state.rot = (0.7071, 0.0, 0.0, -0.7071)
     #robot_left.init_state.rot = (0.9239, 0.0, -0.3827, 0.0)
+    robot_left.init_state.joint_pos = {
+        "psm_yaw_joint": -0.5,
+        "psm_pitch_end_joint": -0.5,
+        "psm_main_insertion_joint": 0.08,
+        "psm_tool_roll_joint": 0.0,
+        "psm_tool_pitch_joint": -0.785,
+        "psm_tool_yaw_joint": 0.0,
+    }
 
     # robot: ArticulationCfg = DAVINCI_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
     # # Forziamo la posizione iniziale del robot per metterlo SOPRA il tavolo (Z=0.5)
@@ -384,11 +392,18 @@ class TerminationsCfg:
 
     # (1) Time out
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
-    # (2) Cart out of bounds
-    # cart_out_of_bounds = DoneTerm(
-    #     func=mdp.joint_pos_out_of_manual_limit,
-    #     params={"asset_cfg": SceneEntityCfg("robot", joint_names=["slider_to_cart"]), "bounds": (-3.0, 3.0)},
-    # )
+
+    # (2) Ring fuori dal workspace (frame locale per ogni env)
+    # Il PegBoard è a (0.375, -0.05, 0.71): ±10cm intorno al centro
+    ring_out_of_bounds = DoneTerm(
+        func=mdp.ring_out_of_bounds,
+        params={
+            "ring_names": ["ring_red", "ring_yellow", "ring_green", "ring_blue"],
+            "x_bounds": (0.28, 0.47),
+            "y_bounds": (-0.16, 0.06),
+            "z_min": 0.69,
+        },
+    )
 
 
 ##
@@ -413,7 +428,7 @@ class MDvrkEnvCfg(ManagerBasedRLEnvCfg):
         """Post initialization."""
         # general settings
         self.decimation = 2
-        self.episode_length_s = 5000
+        self.episode_length_s = 100  # ~12.000 step IsaacLab: coerente con max_steps=400 del wrapper RL
         # viewer settings
         self.viewer.eye = (8.0, 0.0, 5.0)
         # simulation settings
