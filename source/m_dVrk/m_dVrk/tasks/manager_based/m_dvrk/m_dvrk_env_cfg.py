@@ -36,6 +36,9 @@ from isaaclab.envs.mdp.actions.actions_cfg import OperationalSpaceControllerActi
 from isaaclab_assets.robots.cartpole import CARTPOLE_CFG  # isort:skip
 from m_dVrk.assets import DAVINCI_CFG
 
+import math
+import isaaclab.utils.math as math_utils
+import torch
 
 ##
 # Scene definition
@@ -45,7 +48,7 @@ from m_dVrk.assets import DAVINCI_CFG
 class PegRingSceneCfg(InteractiveSceneCfg):
     """1. Configurazione della Scena (Gli Attori)"""
     
-    # Pavimento e Luce
+    # ground and lights
     ground = AssetBaseCfg(
         prim_path="/World/ground",
         spawn=sim_utils.GroundPlaneCfg(size=(100.0, 100.0)),
@@ -55,103 +58,156 @@ class PegRingSceneCfg(InteractiveSceneCfg):
         spawn=sim_utils.DomeLightCfg(intensity=3000.0, color=(0.75, 0.75, 0.75)),
     )
 
-    # Tavolo Operatorio
+    # Table
     table = AssetBaseCfg(
         prim_path="{ENV_REGEX_NS}/Table", 
         spawn=sim_utils.UsdFileCfg(usd_path=f"{USD_DATA_DIR}/table.usd"),
         init_state=AssetBaseCfg.InitialStateCfg(pos=(0.4, 0.0, 0.25)),
     )
 
-    # La Basetta del Peg and Ring
+    # Peg and Ring base
     peg_board = AssetBaseCfg(
-        prim_path="{ENV_REGEX_NS}/PegBoard", # <--- Tolto /Table/
+        prim_path="{ENV_REGEX_NS}/PegBoard",
         spawn=sim_utils.UsdFileCfg(usd_path=f"{USD_DATA_DIR}/pn_base2.usd"),
-        # Z=0.51: Se il tavolo è alto 0.5, la poggiamo proprio sopra
         init_state=AssetBaseCfg.InitialStateCfg(pos=(0.375, -0.05, 0.71), rot=(0.0, 0.0, 0.0, 1.0)), 
     )
 
     # ==========================================
-    # TRACCIAMENTO XFORM DEI PEG
+    # PEGS XFORM
     # ==========================================
     peg_red = AssetBaseCfg(
-        prim_path="{ENV_REGEX_NS}/PegBoard/peg_red/peg_red", # Assicurati che questo nome corrisponda all'albero del tuo USD
-        spawn=None, # FONDAMENTALE: Non spawna niente, traccia e basta l'oggetto esistente!
+        prim_path="{ENV_REGEX_NS}/PegBoard/peg_red",
+        spawn=None,
     )
     peg_yellow = AssetBaseCfg(
-        prim_path="{ENV_REGEX_NS}/PegBoard/peg_yellow/peg_yellow",
+        prim_path="{ENV_REGEX_NS}/PegBoard/peg_yellow",
         spawn=None,
     )
     peg_green = AssetBaseCfg(
-        prim_path="{ENV_REGEX_NS}/PegBoard/peg_green/peg_green",
+        prim_path="{ENV_REGEX_NS}/PegBoard/peg_green",
         spawn=None,
     )
     peg_blue = AssetBaseCfg(
-        prim_path="{ENV_REGEX_NS}/PegBoard/peg_blue/peg_blue",
+        prim_path="{ENV_REGEX_NS}/PegBoard/peg_blue",
         spawn=None,
     )
 
     peg_gray = AssetBaseCfg(
-        # ATTENZIONE: Controlla che questo path corrisponda al tuo albero USD!
-        prim_path="{ENV_REGEX_NS}/PegBoard/peg_gray/peg_gray", 
+        prim_path="{ENV_REGEX_NS}/PegBoard/peg_gray",
         spawn=None,
     )
 
     peg_gray1 = AssetBaseCfg(
-        # ATTENZIONE: Controlla che questo path corrisponda al tuo albero USD!
-        prim_path="{ENV_REGEX_NS}/PegBoard/peg_gray1/peg_gray1", 
+        prim_path="{ENV_REGEX_NS}/PegBoard/peg_gray1",
         spawn=None,
     )
 
-    # # Anello Rosso
-    # ring_red = RigidObjectCfg(
-    #     prim_path="{ENV_REGEX_NS}/RingRed", # <--- Tolto /Table/PegBoard/
-    #     spawn=sim_utils.UsdFileCfg(usd_path=f"{USD_DATA_DIR}/red_ring.usd"),
-    #     # Z=0.7: 20 centimetri SOPRA il tavolo. Cadranno come pioggia.
-    #     init_state=RigidObjectCfg.InitialStateCfg(pos=(0.4, 0.1, 0.77)), 
-    # )
+    peg_gray2 = AssetBaseCfg(
+        prim_path="{ENV_REGEX_NS}/PegBoard/peg_gray2",
+        spawn=None,
+    )
 
-    # Anello Rosso (In alto a destra rispetto al centro)
+    peg_gray3 = AssetBaseCfg(
+        prim_path="{ENV_REGEX_NS}/PegBoard/peg_gray3",
+        spawn=None,
+    )
+
+    # Red Ring
     ring_red = RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/RingRed",
         spawn=sim_utils.UsdFileCfg(
             usd_path=f"{USD_DATA_DIR}/red_ring.usd",
-            rigid_props=sim_utils.RigidBodyPropertiesCfg(),
+            scale=(1.0, 1.0, 0.5),
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                rigid_body_enabled=True,
+                kinematic_enabled=True,
+                disable_gravity=True,
+                linear_damping=0.2,
+                angular_damping=0.5,
+                max_linear_velocity=0.5,
+                max_angular_velocity=30.0,
+                max_depenetration_velocity=0.05,
+            ),
+            collision_props=sim_utils.CollisionPropertiesCfg(contact_offset=0.001, rest_offset=0.0),
             mass_props=sim_utils.MassPropertiesCfg(mass=0.01),
         ),
-        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.375, -0.04, 0.77)), 
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.335, -0.055, 0.717)), 
     )
 
-    # Anello Giallo (In basso a destra)
+    # Yellow Ring
     ring_yellow = RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/RingYellow",
-        spawn=sim_utils.UsdFileCfg(usd_path=f"{USD_DATA_DIR}/yellow_ring.usd"),
-        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.375, -0.04, 0.77)),
+        spawn=sim_utils.UsdFileCfg(
+            usd_path=f"{USD_DATA_DIR}/yellow_ring.usd",
+            scale=(1.0, 1.0, 0.5),
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                rigid_body_enabled=True,
+                kinematic_enabled=True,
+                disable_gravity=True,
+                linear_damping=0.2,
+                angular_damping=0.5,
+                max_linear_velocity=0.5,
+                max_angular_velocity=30.0,
+                max_depenetration_velocity=0.05,
+            ),
+            collision_props=sim_utils.CollisionPropertiesCfg(contact_offset=0.001, rest_offset=0.0),
+            mass_props=sim_utils.MassPropertiesCfg(mass=0.01),
+        ),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.362, -0.055, 0.717)),
     )
 
-    # Anello Verde (In alto a sinistra)
+    # Green Ring
     ring_green = RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/RingGreen",
-        spawn=sim_utils.UsdFileCfg(usd_path=f"{USD_DATA_DIR}/green_ring.usd"),
-        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.375, -0.04, 0.77)),
+        spawn=sim_utils.UsdFileCfg(
+            usd_path=f"{USD_DATA_DIR}/green_ring.usd",
+            scale=(1.0, 1.0, 0.5),
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                rigid_body_enabled=True,
+                kinematic_enabled=True,
+                disable_gravity=True,
+                linear_damping=0.2,
+                angular_damping=0.5,
+                max_linear_velocity=0.5,
+                max_angular_velocity=30.0,
+                max_depenetration_velocity=0.05,
+            ),
+            collision_props=sim_utils.CollisionPropertiesCfg(contact_offset=0.001, rest_offset=0.0),
+            mass_props=sim_utils.MassPropertiesCfg(mass=0.01),
+        ),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.388, -0.055, 0.717)),
     )
 
-    # Anello Blu (In basso a sinistra)
+    # Blue Ring
     ring_blue = RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/RingBlue",
-        spawn=sim_utils.UsdFileCfg(usd_path=f"{USD_DATA_DIR}/blue_ring.usd"),
-        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.375, -0.04, 0.77)),
+        spawn=sim_utils.UsdFileCfg(
+            usd_path=f"{USD_DATA_DIR}/blue_ring.usd",
+            scale=(1.0, 1.0, 0.5),
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                rigid_body_enabled=True,
+                kinematic_enabled=True,
+                disable_gravity=True,
+                linear_damping=0.2,
+                angular_damping=0.5,
+                max_linear_velocity=0.5,
+                max_angular_velocity=30.0,
+                max_depenetration_velocity=0.05,
+            ),
+            collision_props=sim_utils.CollisionPropertiesCfg(contact_offset=0.001, rest_offset=0.0),
+            mass_props=sim_utils.MassPropertiesCfg(mass=0.01),
+        ),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.415, -0.055, 0.717)),
     )
 
-    # Il Robot daVinci
+    # daVinci Robot
 
     # ==========================================
-    # ROBOT (Destro e Sinistro)
+    # ROBOT (Right and Left Arm)
     # ==========================================
-    # Braccio Destro (Spostato di -25 cm sull'asse Y)
+    # Right arm
     robot_right: ArticulationCfg = DAVINCI_CFG.replace(prim_path="{ENV_REGEX_NS}/RobotRight")
     robot_right.init_state.pos = (0.25, -0.15, 0.8) 
-    #robot_right.init_state.rot = (0.7071, 0.0, 0.0, -0.7071)
-    #robot_right.init_state.rot = (0.9239, 0.0, 0.3827, 0.0)
     robot_right.init_state.joint_pos = {
         "psm_yaw_joint": 0.5,
         "psm_pitch_end_joint": -0.5,      
@@ -161,11 +217,9 @@ class PegRingSceneCfg(InteractiveSceneCfg):
         "psm_tool_yaw_joint": 0.0,
     }
 
-    # Braccio Sinistro (Spostato di +25 cm sull'asse Y)
+    # Left arm
     robot_left: ArticulationCfg = DAVINCI_CFG.replace(prim_path="{ENV_REGEX_NS}/RobotLeft")
     robot_left.init_state.pos = (0.5, -0.15, 0.8)
-    #robot_left.init_state.rot = (0.7071, 0.0, 0.0, -0.7071)
-    #robot_left.init_state.rot = (0.9239, 0.0, -0.3827, 0.0)
     robot_left.init_state.joint_pos = {
         "psm_yaw_joint": -0.5,
         "psm_pitch_end_joint": -0.5,
@@ -175,35 +229,28 @@ class PegRingSceneCfg(InteractiveSceneCfg):
         "psm_tool_yaw_joint": 0.0,
     }
 
-    # robot: ArticulationCfg = DAVINCI_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
-    # # Forziamo la posizione iniziale del robot per metterlo SOPRA il tavolo (Z=0.5)
-    # robot.init_state.pos = (0.25, 0.0, 0.8)
-
     # ==========================================
-    # TELECAMERA
+    # CAMERA
     # ==========================================
     camera: CameraCfg = CameraCfg(
         prim_path="{ENV_REGEX_NS}/Camera",
-        update_period=0.0,
+        # Render every ~3.3s of sim time (= 400 step @ 120Hz = 1 RL-step).
+        update_period=1/30.0,
         height=480,
         width=640,
         data_types=["rgb"],
         spawn=sim_utils.PinholeCameraCfg(
-            # focale più bassa = grandangolo (tipico degli endoscopi per vedere entrambi i bracci)
-            focal_length=18.0, 
+            focal_length=23.5, 
             focus_distance=400.0, 
             horizontal_aperture=20.955, 
-            # Clipping vicino ridotto a 1 cm (0.01) così non taglia via i bracci se si avvicinano troppo alla lente
             clipping_range=(0.01, 1.0e5) 
         ),
         offset=CameraCfg.OffsetCfg(
-            # POSIZIONE: La mettiamo dietro e in mezzo ai due bracci (X=0.15, Y=0.0) 
-            # e a un'altezza di 90 cm (Z=0.9), poco sopra le basi dei robot
-            pos=(0.375, 0.15, 0.85), 
+            pos=(0.375, 0.125, 0.85), 
             
-            # ROTAZIONE: Guarda dritto davanti a sé (verso X=0.4) e si inclina in basso di ~30 gradi
-            # (Quaternione calcolato: Pitch -30°, Yaw -90°, Roll 0°)
-            rot=(0.683, 0.183, 0.183, -0.683), #(-0.7596879, 0, 0.6502878, 0),#(-0.3990808, -0.5533322, 0.3416105, -0.6464211),# [ -0.21829, -0.4355324, -0.7807314, 0.3913048 ]
+            # ROTATION: Pitch 40°, Yaw -90°, Roll 0° ([w, x, y, z])
+            rot=(0.664, 0.242, 0.242, -0.664), 
+            
             convention="world"
         ),
     )
@@ -226,13 +273,13 @@ class ActionsCfg:
             "psm_tool_roll_joint",
             "psm_tool_pitch_joint",
             "psm_tool_yaw_joint",
-            ], # Regex per i giunti del braccio che l'IK può muovere
+            ],
 
         body_name="psm_tool_tip_link",
 
         controller=DifferentialIKControllerCfg(
             command_type="pose",
-            use_relative_mode=True,   # False = Coordinate assolute nel mondo (meglio per la Macchina a Stati)
+            use_relative_mode=False,
             ik_method="pinv",
         ),
         scale=1.0,
@@ -256,16 +303,16 @@ class ActionsCfg:
             "psm_tool_roll_joint",
             "psm_tool_pitch_joint",
             "psm_tool_yaw_joint",
-            ], # Regex per i giunti del braccio che l'IK può muovere
+            ],
 
         body_name="psm_tool_tip_link",
 
         controller=DifferentialIKControllerCfg(
             command_type="pose",
-            use_relative_mode=True,   # False = Coordinate assolute nel mondo (meglio per la Macchina a Stati)
+            use_relative_mode=False,
             ik_method="pinv",
         ),
-        scale=0.5,
+        scale=1.0,
     )
     
     
@@ -291,7 +338,6 @@ class ObservationsCfg:
 
         joint_vel_right = ObsTerm(func=mdp.joint_vel_rel, params={"asset_cfg": SceneEntityCfg("robot_right")})
         joint_vel_left = ObsTerm(func=mdp.joint_vel_rel, params={"asset_cfg": SceneEntityCfg("robot_left")})
-        #joint_vel_rel = ObsTerm(func=mdp.joint_vel_rel)
 
         def __post_init__(self) -> None:
             self.enable_corruption = False
@@ -305,20 +351,27 @@ class ObservationsCfg:
 class EventCfg:
     """Configuration for events."""
 
+    disable_arm_arm_collisions = EventTerm(
+        func=mdp.disable_collisions_between_assets,
+        mode="startup",
+        params={
+            "asset_name_a": "robot_right",
+            "asset_name_b": "robot_left",
+        },
+    )
+
     # reset
     reset_robot_right = EventTerm(
-        #func=mdp.reset_joints_by_scale,
         func=mdp.reset_joints_by_offset,
         mode="reset",
         params={
             "asset_cfg": SceneEntityCfg("robot_right"),
-            "position_range": (0.0, 0.0), # o quello che avevi prima
+            "position_range": (0.0, 0.0),
             "velocity_range": (0.0, 0.0),
         },
     )
     
     reset_robot_left = EventTerm(
-        #func=mdp.reset_joints_by_scale,
         func=mdp.reset_joints_by_offset,
         mode="reset",
         params={
@@ -328,44 +381,35 @@ class EventCfg:
         },
     )
 
-    reset_ring_red = EventTerm(
-        func=mdp.reset_root_state_uniform,
+    reset_rings = EventTerm(
+        func=mdp.reset_rings_on_board,
         mode="reset",
         params={
-            "asset_cfg": SceneEntityCfg("ring_red"),
-            # Ridotto a +/- 1 cm
-            "pose_range": {"x": (-0.05, 0.05), "y": (-0.06, -0.02), "yaw": (-3.14, 3.14)},
-            "velocity_range": {},
-        },
-    )
-    
-    reset_ring_yellow = EventTerm(
-        func=mdp.reset_root_state_uniform,
-        mode="reset",
-        params={
-            "asset_cfg": SceneEntityCfg("ring_yellow"),
-            "pose_range": {"x": (-0.05, 0.05), "y": (-0.06, -0.02), "yaw": (-3.14, 3.14)},
-            "velocity_range": {},
-        },
-    )
-
-    reset_ring_green = EventTerm(
-        func=mdp.reset_root_state_uniform,
-        mode="reset",
-        params={
-            "asset_cfg": SceneEntityCfg("ring_green"),
-            "pose_range": {"x": (-0.05, 0.05), "y": (-0.06, -0.02), "yaw": (-3.14, 3.14)},
-            "velocity_range": {},
-        },
-    )
-
-    reset_ring_blue = EventTerm(
-        func=mdp.reset_root_state_uniform,
-        mode="reset",
-        params={
-            "asset_cfg": SceneEntityCfg("ring_blue"),
-            "pose_range": {"x": (-0.05, 0.05), "y": (-0.06, -0.02), "yaw": (-3.14, 3.14)},
-            "velocity_range": {},
+            "ring_names": ["ring_red", "ring_yellow", "ring_green", "ring_blue"],
+            "peg_names": [
+                "peg_red",
+                "peg_yellow",
+                "peg_green",
+                "peg_blue",
+                "peg_gray",
+                "peg_gray1",
+                "peg_gray2",
+                "peg_gray3",
+            ],
+            "x_range": (0.318, 0.432),
+            "y_range": (-0.107, 0.007),
+            "z_height": 0.717,
+            "min_ring_clearance": 0.020,
+            "min_peg_clearance": 0.016,
+            "yaw_range": (-3.14, 3.14),
+            "max_sample_attempts": 256,
+            "randomize": True,
+            "fixed_ring_poses": {
+                "ring_red": (0.335, -0.055, 0.717, 0.0),
+                "ring_yellow": (0.362, -0.055, 0.717, 0.0),
+                "ring_green": (0.388, -0.055, 0.717, 0.0),
+                "ring_blue": (0.415, -0.055, 0.717, 0.0),
+            },
         },
     )
     # reset_pole_position = EventTerm(
@@ -393,8 +437,8 @@ class TerminationsCfg:
     # (1) Time out
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
 
-    # (2) Ring fuori dal workspace (frame locale per ogni env)
-    # Il PegBoard è a (0.375, -0.05, 0.71): ±10cm intorno al centro
+    # (2) Ring out of workspace (local frame for each env)
+    # The PegBoard is at (0.375, -0.05, 0.71): ±10cm around the center
     ring_out_of_bounds = DoneTerm(
         func=mdp.ring_out_of_bounds,
         params={
@@ -427,10 +471,10 @@ class MDvrkEnvCfg(ManagerBasedRLEnvCfg):
     def __post_init__(self) -> None:
         """Post initialization."""
         # general settings
-        self.decimation = 2
-        self.episode_length_s = 100  # ~12.000 step IsaacLab: coerente con max_steps=400 del wrapper RL
+        self.decimation = 10
+        self.episode_length_s = 60
         # viewer settings
         self.viewer.eye = (8.0, 0.0, 5.0)
         # simulation settings
-        self.sim.dt = 1 / 120
+        self.sim.dt = 0.01
         self.sim.render_interval = self.decimation

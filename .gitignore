@@ -87,3 +87,22 @@ tests/
 *.usdz
 *.mp4
 *.hdf5
+*.png
+*.txt
+*.pdf
+
+# Blocca cartelle specifiche
+/reward_debug_frames
+/modelli_salvati
+/modelli_salvati1
+/modelli_salvati_sim
+/res_1.5mln
+/res_2.5mln
+/res_4mln
+/res_5mln
+/Data
+/sb3_log
+/sb3_log_sim
+/tensorboard_logs
+/${data}
+/scripts/video

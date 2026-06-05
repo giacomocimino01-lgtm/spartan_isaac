@@ -24,7 +24,7 @@ INSTALL_REQUIRES = [
 # Installation operation
 setup(
     name="m_dVrk",
-    packages=find_packages(where="."),  # trova automaticamente m_dVrk e tutti i suoi sub-package
+    packages=find_packages(where="."),
     author=EXTENSION_TOML_DATA["package"]["author"],
     maintainer=EXTENSION_TOML_DATA["package"]["maintainer"],
     url=EXTENSION_TOML_DATA["package"]["repository"],

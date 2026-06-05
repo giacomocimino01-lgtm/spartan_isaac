@@ -1,55 +1,42 @@
-"""Script VETTORIZZATO dVRK: RL Multi-Ambiente + XIRL Batched + SPARTAN Hive-Mind."""
 import argparse
-from collections import deque
-import csv
+import threading
 import os
 import glob
 import random
+import math
 import numpy as np
 import torch
-import torch.backends.cudnn as cudnn
-import math
 import torch.nn as nn
+import torch.nn.functional as F
 import torchvision.models as models
 import torchvision.transforms as T
 import torchvision.io as io
+import cv2
 
-from app_launcher_utils import pin_process_to_requested_cuda_device
 import gymnasium as gym
 from gymnasium import spaces
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import VecMonitor
 from stable_baselines3.common.vec_env import VecEnv
-from stable_baselines3.common.vec_env import VecNormalize
-from stable_baselines3.common.callbacks import BaseCallback, CallbackList, CheckpointCallback
+from stable_baselines3.common.callbacks import CheckpointCallback
 from stable_baselines3.common.logger import configure
 
-# 1. SETUP INIZIALE DI ISAAC SIM
+# 1. INITIAL SETUP OF ISAAC SIM
 from isaaclab.app import AppLauncher
 
-parser = argparse.ArgumentParser(description="Macchina a stati per il Peg and Ring con RL.")
-parser.add_argument("--num_envs", type=int, default=64, help="Numero di ambienti da spawnare in parallelo.")
-parser.add_argument(
-    "--randomize_rings",
-    action="store_true",
-    help="Randomize ring reset positions. By default, rings reset to a fixed deterministic layout.",
-)
+parser = argparse.ArgumentParser(description="Inference evaluation of RL agent.")
+parser.add_argument("--num_envs", type=int, default=1, help="Number of environments (default 1 for evaluation).")
+parser.add_argument("--checkpoint", type=str, default="/home/aiprah/Documents/m_dVrk/modelli_salvati_sim/dvrk_ppo_best_terminal_distance.zip", help="Path to the .zip model file to load.")
+parser.add_argument("--dataset_path", type=str, default="/mnt/data/aiprah/data/sim_dataset_xirl_extra/train/phase_0/", help="Path to Xirl demonstrations dataset for computing mean goal embedding.")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
-requested_device = getattr(args_cli, "device", None)
-args_cli.device = pin_process_to_requested_cuda_device(requested_device)
-if requested_device != args_cli.device and requested_device is not None and "cuda" in requested_device:
-    print(
-        f"[INFO] Remapped device {requested_device} -> {args_cli.device} "
-        f"with CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')}"
-    )
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
 from isaaclab.envs import ManagerBasedRLEnv
+import isaaclab.utils.math as math_utils
 from m_dVrk.tasks.manager_based.m_dvrk.m_dvrk_env_cfg import MDvrkEnvCfg 
 
-import torch.nn.functional as F
 from parallel_env import SPARTANStateMachine, get_scene_entity_positions_w
 
 VERB_MAP = {0: "reach", 1: "grasp", 2: "release", 3: "idle"}
@@ -72,57 +59,32 @@ IDLE_ACTION = torch.tensor(
     dtype=torch.long,
 )
 
+PHYSICS_STEPS_PER_RL_STEP = 400
+INVALID_COMMAND_PENALTY = 1.0
 REWARD_DEBUG_DUMP_INTERVAL = 500
 REWARD_DEBUG_DUMP_ENV_IDS = (0,)
 REWARD_DEBUG_DUMP_DIR = "reward_debug_frames"
-REWARD_DEBUG_DUMP_MAX_PER_ENV = 200
-PPO_TARGET_TRANSITIONS_PER_UPDATE = 8192
-PPO_PREFERRED_BATCH_SIZE = 2048
-PPO_N_EPOCHS = 5
-PPO_LEARNING_RATE = 3e-4
-PPO_ENT_COEF = 0.015
-EPISODE_CSV_FILENAME = "episode_progress.csv"
-INVALID_COMMAND_PENALTY = 1.0
-BEST_TERMINAL_DISTANCE_WINDOW_EPISODES = 10
-BEST_TERMINAL_DISTANCE_PREFIX = "dvrk_ppo_best_terminal_distance"
+REWARD_DEBUG_DUMP_MAX_PER_ENV = 400
 
 # ==========================================
-# CLASSE XIRL: CLONE DELLA RETE PRE-TRAINATA
+# CLASS XIRL: CLONE OF THE PRETRAINED TCC NETWORK
 # ==========================================
 class XIRLResnet18(nn.Module):
-    """
-    Matches XIRL config:
-
-        model_type = "resnet18_linear"
-        embedding_size = 32
-        normalize_embeddings = False
-        learnable_temp = False
-
-    Compatible with checkpoints containing:
-        backbone.*
-        encoder.*
-    """
-
     def __init__(self, embedding_size=32):
         super().__init__()
-
         resnet = models.resnet18(weights=None)
         num_ftrs = resnet.fc.in_features
-
         self.backbone = nn.Sequential(*list(resnet.children())[:-1])
         self.encoder = nn.Linear(num_ftrs, embedding_size)
 
     def forward(self, x):
-        # x: (B, C, H, W)
         feats = self.backbone(x)          # (B, 512, 1, 1)
         feats = torch.flatten(feats, 1)   # (B, 512)
         embs = self.encoder(feats)        # (B, 32)
-
-        # Important: config.model.normalize_embeddings = False
         return embs
 
 # ==========================================
-# CLASSE 1.5: IL WRAPPER RL VETTORIZZATO (Eredita da VecEnv!)
+# CLASS 1.5: THE WRAPPER RL
 # ==========================================
 class DVRKVisionHRLWrapper(VecEnv):
     def __init__(self, isaac_env, state_machine, tcc_model=None):
@@ -163,7 +125,7 @@ class DVRKVisionHRLWrapper(VecEnv):
         if self.reward_debug_dump_interval > 0 and self.reward_debug_dump_env_ids and self.reward_debug_dump_max_per_env > 0:
             os.makedirs(self.reward_debug_dump_dir, exist_ok=True)
             print(
-                f"[RewardDebug] Dump attivo: every={self.reward_debug_dump_interval} step, "
+                f"[RewardDebug] Active dump: every={self.reward_debug_dump_interval} steps, "
                 f"envs={self.reward_debug_dump_env_ids}, dir={self.reward_debug_dump_dir}"
             )
 
@@ -206,13 +168,13 @@ class DVRKVisionHRLWrapper(VecEnv):
             try:
                 env_id = int(raw_env_id)
             except ValueError:
-                print(f"[RewardDebug] Ignoro env id non valido: {raw_env_id}")
+                print(f"[RewardDebug] Ignoring invalid env id: {raw_env_id}")
                 continue
 
             if 0 <= env_id < self.num_envs:
                 env_ids.append(env_id)
             else:
-                print(f"[RewardDebug] Ignoro env id fuori range: {env_id}")
+                print(f"[RewardDebug] Ignoring out-of-range env id: {env_id}")
 
         return sorted(set(env_ids))
 
@@ -643,7 +605,7 @@ class DVRKVisionHRLWrapper(VecEnv):
 
         self.current_step += 1
         
-        # --- RIBILANCIAMENTO REWARD ---
+        # --- Reward ---
         rew_distance_raw = torch.norm(new_embs - self.goal_embedding, dim=1) ** 2
         rewards = -rew_distance_raw * 1e-3
         rewards -= invalid_command_counts * INVALID_COMMAND_PENALTY
@@ -744,7 +706,7 @@ class DVRKVisionHRLWrapper(VecEnv):
 def compute_average_goal_embedding(tcc_model, preprocess, dataset_path, device):
     embeddings = []
     video_dirs = sorted([os.path.join(dataset_path, d) for d in os.listdir(dataset_path) if os.path.isdir(os.path.join(dataset_path, d))])
-    print(f"[INFO] Calcolo Goal medio da {len(video_dirs)} video in {dataset_path}...")
+    print(f"[INFO] Computing mean goal from {len(video_dirs)} videos in {dataset_path}...")
     for v_dir in video_dirs:
         frames = sorted(glob.glob(os.path.join(v_dir, "*.jpg")) + glob.glob(os.path.join(v_dir, "*.png")))
         if not frames: continue
@@ -756,229 +718,24 @@ def compute_average_goal_embedding(tcc_model, preprocess, dataset_path, device):
                 emb = tcc_model(preprocess(img)).squeeze()
             embeddings.append(emb)
         except Exception as e:
-            print(f"[Warning] Impossibile processare {last_frame_path}: {e}")
-    if not embeddings: raise ValueError("Nessun frame valido trovato nel dataset per il calcolo del Goal!")
+            print(f"[Warning] Cannot process {last_frame_path}: {e}")
+    if not embeddings: raise ValueError("No valid frames found in the dataset to compute the goal!")
     stacked_embs = torch.stack(embeddings)
     mean_goal_embedding = torch.mean(stacked_embs, dim=0)
-    print(f"[INFO] Goal medio calcolato con successo da {len(embeddings)} frame finali!")
+    print(f"[INFO] Mean goal computed successfully from {len(embeddings)} final frames!")
     return mean_goal_embedding
 
-def set_seed(seed=42):
-    # 1. Python random (per librerie base)
-    random.seed(seed)
-    
-    # 2. Numpy (usato internamente da Gym/SB3)
-    np.random.seed(seed)
-    
-    # 3. PyTorch (inizializzazione pesi PPO)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed) # Se usi multi-GPU
-    
-    # Rende le operazioni convoluzionali e GPU deterministiche (sacrifica un filo di velocità per la riproducibilità)
-    cudnn.deterministic = True
-    cudnn.benchmark = False
-
-# Applica il seed
-set_seed(42)
-
-
-def derive_ppo_n_steps(num_envs: int, target_transitions_per_update: int) -> int:
-    safe_num_envs = max(1, num_envs)
-    safe_target = max(1, target_transitions_per_update)
-    return max(1, math.ceil(safe_target / safe_num_envs))
-
-
-def derive_ppo_batch_size(effective_batch_size: int, preferred_batch_size: int) -> int:
-    safe_effective_batch_size = max(1, int(effective_batch_size))
-    start = min(max(1, int(preferred_batch_size)), safe_effective_batch_size)
-    for batch_size in range(start, 0, -1):
-        if safe_effective_batch_size % batch_size == 0:
-            return batch_size
-    return 1
-
-
-class EpisodeCsvLoggerCallback(BaseCallback):
-    def __init__(self, file_path: str, verbose: int = 0):
-        super().__init__(verbose)
-        self.file_path = file_path
-        self._file = None
-        self._writer = None
-
-    def _on_training_start(self) -> None:
-        os.makedirs(os.path.dirname(self.file_path), exist_ok=True)
-        self._file = open(self.file_path, "w", newline="")
-        self._writer = csv.DictWriter(
-            self._file,
-            fieldnames=[
-                "total_timesteps",
-                "env_id",
-                "episode_reward",
-                "episode_length",
-                "episode_time_seconds",
-                "is_success",
-                "terminal_distance",
-                "green_peg_ring_count",
-                "time_limit_truncated",
-            ],
-        )
-        self._writer.writeheader()
-        self._file.flush()
-        print(f"[PPO] Episode CSV logger active: {self.file_path}", flush=True)
-
-    def _on_step(self) -> bool:
-        infos = self.locals.get("infos")
-        if infos is None or self._writer is None:
-            return True
-
-        wrote_rows = False
-        for env_id, info in enumerate(infos):
-            episode = info.get("episode")
-            if episode is None:
-                continue
-
-            self._writer.writerow(
-                {
-                    "total_timesteps": int(self.num_timesteps),
-                    "env_id": env_id,
-                    "episode_reward": float(episode.get("r", 0.0)),
-                    "episode_length": int(episode.get("l", 0)),
-                    "episode_time_seconds": float(episode.get("t", 0.0)),
-                    "is_success": bool(info.get("is_success", False)),
-                    "terminal_distance": float(info.get("terminal_distance", float("nan"))),
-                    "green_peg_ring_count": int(info.get("green_peg_ring_count", 0)),
-                    "time_limit_truncated": bool(info.get("TimeLimit.truncated", False)),
-                }
-            )
-            wrote_rows = True
-
-        if wrote_rows and self._file is not None:
-            self._file.flush()
-
-        return True
-
-    def _on_training_end(self) -> None:
-        if self._file is not None:
-            self._file.close()
-            self._file = None
-            self._writer = None
-
-
-class BestTerminalDistanceCheckpointCallback(BaseCallback):
-    def __init__(self, save_dir: str, file_prefix: str, window_size: int, verbose: int = 0):
-        super().__init__(verbose)
-        self.save_dir = save_dir
-        self.file_prefix = file_prefix
-        self.window_size = max(1, int(window_size))
-        self.best_mean_terminal_distance = float("inf")
-        self.recent_terminal_distances = deque(maxlen=self.window_size)
-
-    def _on_training_start(self) -> None:
-        os.makedirs(self.save_dir, exist_ok=True)
-
-    def _on_step(self) -> bool:
-        infos = self.locals.get("infos")
-        if infos is None:
-            return True
-
-        for info in infos:
-            episode = info.get("episode")
-            terminal_distance = info.get("terminal_distance")
-            if episode is None or terminal_distance is None:
-                continue
-
-            terminal_distance = float(terminal_distance)
-            if not math.isfinite(terminal_distance):
-                continue
-
-            self.recent_terminal_distances.append(terminal_distance)
-
-        if len(self.recent_terminal_distances) < self.window_size:
-            return True
-
-        mean_terminal_distance = sum(self.recent_terminal_distances) / len(self.recent_terminal_distances)
-        if mean_terminal_distance >= self.best_mean_terminal_distance:
-            return True
-
-        self.best_mean_terminal_distance = mean_terminal_distance
-
-        model_path = os.path.join(self.save_dir, f"{self.file_prefix}.zip")
-        vec_normalize_path = os.path.join(
-            self.save_dir,
-            f"{self.file_prefix}_vecnormalize.pkl",
-        )
-        metric_path = os.path.join(
-            self.save_dir,
-            f"{self.file_prefix}_metrics.txt",
-        )
-
-        self.model.save(model_path)
-
-        vec_normalize_env = self.model.get_vec_normalize_env()
-        if vec_normalize_env is not None:
-            vec_normalize_env.save(vec_normalize_path)
-
-        with open(metric_path, "w", encoding="ascii") as metric_file:
-            metric_file.write(f"num_timesteps={int(self.num_timesteps)}\n")
-            metric_file.write(f"window_size={len(self.recent_terminal_distances)}\n")
-            metric_file.write(f"mean_terminal_distance={mean_terminal_distance:.8f}\n")
-
-        if self.verbose > 0:
-            print(
-                "[Checkpoint] New best terminal distance: "
-                f"mean={mean_terminal_distance:.6f} over last {len(self.recent_terminal_distances)} episodes"
-            )
-
-        return True
-
 # ==========================================
-# TRAINING MAIN
+# EVALUATION MAIN
 # ==========================================
-def main_train():
-    env_cfg = MDvrkEnvCfg()
-    env_cfg.scene.num_envs = args_cli.num_envs
-    env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
-    env_cfg.num_rerenders_on_reset = 2
-    env_cfg.wait_for_textures = False
-    env_cfg.seed = 42
-    env_cfg.events.reset_rings.params["randomize"] = bool(args_cli.randomize_rings)
-    print(
-        "[INFO] Ring reset mode: "
-        f"{'randomized' if args_cli.randomize_rings else 'fixed deterministic'}"
-    )
-    print(f"[INFO] Simulation device: {env_cfg.sim.device}")
+def main_eval():
+    env_cfg = MDvrkEnvCfg(); env_cfg.scene.num_envs = args_cli.num_envs
     isaac_env = ManagerBasedRLEnv(cfg=env_cfg)
-
-    # DEBUG: inspect scene entities
-    print("\n[DEBUG] Scene entity types:")
-    for name in [
-        "ring_red", "ring_yellow", "ring_green", "ring_blue",
-        "peg_red", "peg_yellow", "peg_green", "peg_blue",
-        "peg_gray", "peg_gray1",
-    ]:
-        entity = isaac_env.scene[name]
-        print(
-            f"{name:12s} | "
-            f"type={type(entity)} | "
-            f"has_data={hasattr(entity, 'data')} | "
-            f"has_root_pos_w={hasattr(entity, 'data') and hasattr(entity.data, 'root_pos_w')} | "
-            f"has_get_world_poses={hasattr(entity, 'get_world_poses')}"
-        )
-
-    print("[DEBUG] env_origins:")
-    print(isaac_env.scene.env_origins[:min(5, isaac_env.num_envs)])
-    print()
-
-
     sm = SPARTANStateMachine(isaac_env)
-    tcc = XIRLResnet18(embedding_size=32).to(isaac_env.device)
-
+    tcc = XIRLResnet18(32).to(isaac_env.device)
+    
     try:
-        ckpt = torch.load(
-            "/tmp/xirl/sim_pretrain_runs/200_sim_phase0_tcc/checkpoints/4001.ckpt",
-            map_location=isaac_env.device,
-        )
-
+        ckpt = torch.load("/home/aiprah/Documents/m_dVrk/Data/4001.ckpt", map_location=isaac_env.device)
         if "model" in ckpt:
             sd = ckpt["model"]
         elif "state_dict" in ckpt:
@@ -987,7 +744,6 @@ def main_train():
             sd = ckpt
 
         clean_sd = {}
-
         for k, v in sd.items():
             if k.startswith("module."):
                 k = k[len("module."):]
@@ -996,105 +752,74 @@ def main_train():
             clean_sd[k] = v
 
         load_result = tcc.load_state_dict(clean_sd, strict=True)
-
-        print("[INFO] XIRL weights loaded.")
-        print("[XIRL] missing keys:", load_result.missing_keys)
-        print("[XIRL] unexpected keys:", load_result.unexpected_keys)
-
-    except Exception as e:
-        print(f"[ERR] XIRL weights: {e}")
-        raise RuntimeError("XIRL checkpoint failed to load. Aborting training.") from e
+        print("[INFO] Weights loaded!")
+    except Exception as e: 
+        print(f"[ERR] Weights: {e}")
 
     tcc.eval()
-
     rl_env = DVRKVisionHRLWrapper(isaac_env, sm, tcc)
     
     try:
-        dataset_path = "/mnt/data/aiprah/data/sim_dataset_xirl_extra/train/phase_0/"
         proc = T.Compose([T.Resize((112, 112), antialias=True)])
-        rl_env.goal_embedding = compute_average_goal_embedding(tcc, proc, dataset_path, isaac_env.device)
-    except Exception as e:
-        raise RuntimeError("Failed to compute goal embedding. Aborting training.") from e
+        rl_env.goal_embedding = compute_average_goal_embedding(tcc, proc, args_cli.dataset_path, isaac_env.device)
+        print("[INFO] Goal ready (computed as dataset mean)!")
+    except Exception as e: 
+        print(f"[ERR] Error computing mean goal from dataset: {e}")
+        rl_env.goal_embedding = torch.zeros(32, device=isaac_env.device)
 
-    rl_env = VecMonitor(rl_env)
-    rl_env = VecNormalize(
-        rl_env,
-        norm_obs=True,
-        norm_reward=True,
-        clip_obs=np.inf,
-        clip_reward=np.inf,
-        training=True,
-    )
-
-    tmp_path = "/home/aiprah/Documents/m_dVrk/sb3_log_sim/"
-    episode_csv_path = os.path.join(tmp_path, EPISODE_CSV_FILENAME)
-    vec_normalize_path = os.path.join(tmp_path, "vecnormalize.pkl")
-    new_logger = configure(tmp_path, ["stdout","csv", "tensorboard"])
-    checkpoint_callback = CheckpointCallback(
-        6000,
-        "/home/aiprah/Documents/m_dVrk/modelli_salvati_sim",
-        "dvrk_ppo",
-        save_vecnormalize=True,
-    )
+    print(f"[INFO] Loading model from: {args_cli.checkpoint}")
+    model = PPO.load(args_cli.checkpoint, env=rl_env, device="cuda")
+    camera_sensor = rl_env.unwrapped.env.scene["camera"]
+    video_frames = []
+    print("[INFO] Starting evaluation...")
+    obs = rl_env.reset()
     
-    n_steps = derive_ppo_n_steps(args_cli.num_envs, PPO_TARGET_TRANSITIONS_PER_UPDATE)
-    effective_batch_size = n_steps * args_cli.num_envs
-    batch_size = derive_ppo_batch_size(effective_batch_size, PPO_PREFERRED_BATCH_SIZE)
-    print(
-        f"[PPO] num_envs={args_cli.num_envs} | n_steps={n_steps} | "
-        f"transitions_per_update={effective_batch_size} | batch_size={batch_size} | "
-        f"n_epochs={PPO_N_EPOCHS}"
-    , flush=True)
-    
-    episode_csv_callback = EpisodeCsvLoggerCallback(episode_csv_path)
-    best_terminal_distance_callback = BestTerminalDistanceCheckpointCallback(
-        save_dir="/home/aiprah/Documents/m_dVrk/modelli_salvati_sim",
-        file_prefix=BEST_TERMINAL_DISTANCE_PREFIX,
-        window_size=BEST_TERMINAL_DISTANCE_WINDOW_EPISODES,
-        verbose=1,
-    )
-    callback = CallbackList([
-        checkpoint_callback,
-        episode_csv_callback,
-        best_terminal_distance_callback,
-    ])
+    steps = 0
+    while simulation_app.is_running():
+        # The RL agent computes actions deterministically
+        action, _states = model.predict(obs, deterministic=True)
+        # Executes the step in the environment
+        obs, rewards, dones, infos = rl_env.step(action)
+        
+        # Get active triplets for env 0
+        cmd_l = rl_env.sm.current_triplet_l[0]
+        cmd_r = rl_env.sm.current_triplet_r[0]
+        str_l = f"{cmd_l['verb']} -> {cmd_l['target']}" if cmd_l else "idle -> None"
+        str_r = f"{cmd_r['verb']} -> {cmd_r['target']}" if cmd_r else "idle -> None"
+        print(f"[Step {steps:03d}] Left Arm: {str_l:<20} | Right Arm: {str_r:<20}")
 
-    policy_kwargs = dict(
-    net_arch=dict(
-        pi=[64, 64],
-        vf=[64, 64],
-    ),
-    activation_fn=nn.ReLU,
-    )
+        # Retrieve virtual camera frame (H, W, 4) or (H, W, 3)
+        rgb_data = camera_sensor.data.output["rgb"][0]
+        
+        # Convert to a writable 3-channel numpy array on CPU for drawing
+        frame_np = rgb_data.cpu().numpy()[:, :, :3].copy()
+        
+        # Draw a semi-transparent HUD background banner at the top
+        overlay = frame_np.copy()
+        cv2.rectangle(overlay, (0, 0), (frame_np.shape[1], 75), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.4, frame_np, 0.6, 0, frame_np)
+        
+        # Draw Left Arm (Green) and Right Arm (Cyan) triplets
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        cv2.putText(frame_np, f"LEFT ARM:  {str_l.upper()}", (15, 30), font, 0.6, (50, 255, 50), 2, cv2.LINE_AA)
+        cv2.putText(frame_np, f"RIGHT ARM: {str_r.upper()}", (15, 55), font, 0.6, (50, 200, 255), 2, cv2.LINE_AA)
+        
+        # Draw Step Counter (White) and Reward (Yellow-Gold)
+        cv2.putText(frame_np, f"STEP: {steps:03d}", (frame_np.shape[1] - 150, 30), font, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(frame_np, f"REWARD: {rewards[0]:.4f}", (frame_np.shape[1] - 200, 55), font, 0.6, (100, 230, 255), 2, cv2.LINE_AA)
+        
+        # Convert back to PyTorch CPU tensor and append
+        frame = torch.from_numpy(frame_np)
+        video_frames.append(frame)
 
-    model = PPO(
-        "MlpPolicy",
-        rl_env,
-        verbose=1,
-        device="cuda",
-        seed=42,
-        learning_rate=PPO_LEARNING_RATE,
-        n_steps=n_steps,
-        batch_size=batch_size,
-        n_epochs=PPO_N_EPOCHS,
-        gamma=0.99,
-        gae_lambda=0.95,
-        ent_coef=PPO_ENT_COEF,
-        vf_coef=0.5,
-        max_grad_norm=0.5,
-        stats_window_size=1,
-        tensorboard_log="/home/aiprah/Documents/m_dVrk/tensorboard_logs_sim",
-        policy_kwargs=policy_kwargs,
-    )
-
-    model.set_logger(new_logger)
-    print("[PPO] Model initialized. Starting learn()...", flush=True)
-    model.learn(total_timesteps=5_000_000, log_interval=1, callback=callback)
-    print("[PPO] learn() completed. Saving final model...", flush=True)
-    model.save("/home/aiprah/Documents/m_dVrk/modelli_salvati_sim/dvrk_ppo_finale")
-
-    rl_env.save(vec_normalize_path)
+        if steps >= 390 and video_frames:
+            video_tensor = torch.stack(video_frames) # (T, H, W, C)
+            io.write_video("pov_operazione.mp4", video_tensor, fps=30)
+            print("Video saved: pov_operazione.mp4")
+            steps = 0
+            video_frames = []
+        steps += 1
 
 if __name__ == "__main__":
-    main_train()
+    main_eval()
     simulation_app.close()
