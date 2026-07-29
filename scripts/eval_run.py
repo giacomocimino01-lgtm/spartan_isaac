@@ -16,20 +16,31 @@ import cv2
 import gymnasium as gym
 from gymnasium import spaces
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import VecMonitor
-from stable_baselines3.common.vec_env import VecEnv
+from stable_baselines3.common.vec_env import VecMonitor, VecEnv, VecNormalize
 from stable_baselines3.common.callbacks import CheckpointCallback
 from stable_baselines3.common.logger import configure
 
 # 1. INITIAL SETUP OF ISAAC SIM
 from isaaclab.app import AppLauncher
+from app_launcher_utils import resolve_tcc_checkpoint
 
 parser = argparse.ArgumentParser(description="Inference evaluation of RL agent.")
 parser.add_argument("--num_envs", type=int, default=1, help="Number of environments (default 1 for evaluation).")
 parser.add_argument("--checkpoint", type=str, default="/home/aiprah/Documents/m_dVrk/modelli_salvati_sim/dvrk_ppo_best_terminal_distance.zip", help="Path to the .zip model file to load.")
+parser.add_argument("--tcc_checkpoint", type=str, default="/home/aiprah/Documents/tmp/xirl/sim_pretrain_runs/random_sim_phase0_tcc/checkpoints/4001.ckpt", help="Path to the TCC representation weights.")
 parser.add_argument("--dataset_path", type=str, default="/mnt/data/aiprah/data/sim_dataset_xirl_extra/train/phase_0/", help="Path to Xirl demonstrations dataset for computing mean goal embedding.")
+parser.add_argument(
+    "--randomize_rings",
+    action="store_true",
+    help="Randomize ring reset positions. By default, rings reset to a fixed deterministic layout.",
+)
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
+
+# The camera sensor requires Isaac rendering to be enabled.
+if not getattr(args_cli, "enable_cameras", False):
+    args_cli.enable_cameras = True
+
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
@@ -101,7 +112,7 @@ class DVRKVisionHRLWrapper(VecEnv):
         
         # OBSERVATION SPACE: [emb_stack (stack_size*emb_dim), aux_info (62)]
         self.aux_dim = 62
-        self.geom_dim = 82
+        self.geom_dim = 86
         self.obs_dim = self.stack_size * self.emb_dim + self.aux_dim + self.geom_dim
 
         obs_space = spaces.Box(
@@ -128,6 +139,12 @@ class DVRKVisionHRLWrapper(VecEnv):
                 f"[RewardDebug] Active dump: every={self.reward_debug_dump_interval} steps, "
                 f"envs={self.reward_debug_dump_env_ids}, dir={self.reward_debug_dump_dir}"
             )
+
+        # Number of idle steps to run after task completion before declaring success.
+        # This allows the rendering pipeline to propagate ring positions written via
+        # write_root_state_to_sim to the visual/camera buffer.
+        self.SETTLE_STEPS = 5
+        self.settle_steps_remaining = torch.zeros(self.num_envs, dtype=torch.long, device=self.env.device)
 
         # We need to keep stored the last action to feed it into the state machine logic
         self.prev_actions = IDLE_ACTION.to(self.env.device).unsqueeze(0).repeat(self.num_envs, 1)
@@ -266,7 +283,50 @@ class DVRKVisionHRLWrapper(VecEnv):
 
         assert aux.shape[1] == self.aux_dim, f"Expected {self.aux_dim}, got {aux.shape[1]}"
         return aux
-    
+
+    def _get_manipulable_rings_mask(self) -> torch.Tensor:
+        """Restituisce una maschera (num_envs, 4) con 1.0 se l'anello è manipolabile, 0.0 altrimenti."""
+        device = self.env.device
+        manipulable_mask = torch.zeros((self.num_envs, 4), dtype=torch.float32, device=device)
+
+        for env_i in range(self.num_envs):
+            for ring_idx, ring_name in enumerate(self._ring_names):
+                # 1. Se è già impugnato dal braccio sinistro o destro, non occorre fare re-grasp
+                if (self.sm.attached_target_l[env_i] == ring_name
+                    or self.sm.attached_target_r[env_i] == ring_name):
+                    continue
+
+                # 2. Verifichiamo la posizione dell'anello rispetto ai pioli
+                current_peg = self.sm.ring_support_peg.get(ring_name, [None] * self.num_envs)[env_i]
+
+                if current_peg is not None and current_peg != "None":
+                    # Un ring frozen su un peg finale è già piazzato. In phase1, però,
+                    # i ring partono frozen su peg_green e devono essere presi se top.
+                    placed_on_final_peg = (
+                        (self.task_phase == "phase_0" and current_peg == "peg_green")
+                        or (self.task_phase == "phase_1" and current_peg in {"peg_red", "peg_blue"})
+                    )
+                    if self.sm.frozen_rings_mask[ring_name][env_i] and placed_on_final_peg:
+                        continue
+
+                    # L'anello è su un piolo: è manipolabile SOLO se è in cima.
+                    top_rings = self.sm.get_top_rings_on_peg(env_i, current_peg, num_rings=1)
+                    top_ring = top_rings[0] if top_rings else None
+                    if top_ring == ring_name:
+                        manipulable_mask[env_i, ring_idx] = 1.0
+                else:
+                    if self.sm.frozen_rings_mask[ring_name][env_i]:
+                        continue
+                    # L'anello NON è su un piolo (è libero nel workspace/tavolo)
+                    ring_pos_w = get_scene_entity_positions_w(self.env, ring_name)[env_i]
+                    origin_w = self.env.scene.env_origins[env_i]
+                    rel_pos = ring_pos_w - origin_w  # Posizione locale [x, y, z]
+
+                    in_workspace = (rel_pos[2] > -0.1) and (torch.norm(rel_pos[:2]) < 0.45)
+                    if in_workspace:
+                        manipulable_mask[env_i, ring_idx] = 1.0
+
+        return manipulable_mask
     def _get_geom_obs(self):
         """
         Privileged low-dimensional geometry observations.
@@ -281,7 +341,8 @@ class DVRKVisionHRLWrapper(VecEnv):
             attached flags                       8
             frozen flags                         4
             peg inventory                        4
-        Total:                                  82
+            manipulable flags                    4
+        Total:                                  86
         """
         device = self.env.device
         origins = self.env.scene.env_origins  # (N, 3)
@@ -344,11 +405,12 @@ class DVRKVisionHRLWrapper(VecEnv):
                 attached_l,
                 frozen,
                 inventory,
+                manipulable_mask,
             ],
             dim=1,
         )
 
-        assert geom.shape[1] == 82, f"Expected geom obs dim 82, got {geom.shape[1]}"
+        assert geom.shape[1] == 86, f"Expected geom obs dim 86, got {geom.shape[1]}"
         return geom
 
     def _green_peg_ring_count(self):
@@ -611,7 +673,17 @@ class DVRKVisionHRLWrapper(VecEnv):
         rewards -= invalid_command_counts * INVALID_COMMAND_PENALTY
 
         green_peg_ring_count = self._green_peg_ring_count()
-        task_success = green_peg_ring_count == 4
+        rings_complete = green_peg_ring_count == 4
+        # Start settle countdown when all rings are on the target peg
+        just_completed = rings_complete & (self.settle_steps_remaining == 0)
+        self.settle_steps_remaining[just_completed] = self.SETTLE_STEPS
+        # Decrement active countdowns
+        settling = self.settle_steps_remaining > 0
+        self.settle_steps_remaining[settling] -= 1
+        # Prefer the settled visual state, but do not turn a logically complete
+        # task into a failure just because Isaac time limit fired first.
+        settled_success = rings_complete & (self.settle_steps_remaining == 0)
+        task_success = settled_success | (rings_complete & isaac_done)
         # ------------------------------
 
         # --------------------------------------------------
@@ -637,6 +709,7 @@ class DVRKVisionHRLWrapper(VecEnv):
             infos[idx]["terminal_observation"] = terminal_obs[idx].copy()
             infos[idx]["TimeLimit.truncated"] = bool(truncated_np[idx] and not terminated_np[idx])
             infos[idx]["is_success"] = bool(task_success[idx].item())
+            infos[idx]["rings_complete"] = bool(rings_complete[idx].item())
             infos[idx]["terminal_distance"] = float(rew_distance_raw[idx].item())
             infos[idx]["green_peg_ring_count"] = int(green_peg_ring_count[idx].item())
 
@@ -665,6 +738,7 @@ class DVRKVisionHRLWrapper(VecEnv):
 
                 self.sm.reset_env(idx)
                 self.current_step[idx] = 0
+                self.settle_steps_remaining[idx] = 0
 
                 self.prev_actions[idx] = IDLE_ACTION.to(self.env.device)
                 self.last_override_flags[idx] = 0.0
@@ -729,13 +803,27 @@ def compute_average_goal_embedding(tcc_model, preprocess, dataset_path, device):
 # EVALUATION MAIN
 # ==========================================
 def main_eval():
-    env_cfg = MDvrkEnvCfg(); env_cfg.scene.num_envs = args_cli.num_envs
+    env_cfg = MDvrkEnvCfg()
+    env_cfg.scene.num_envs = args_cli.num_envs
+    env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
+    env_cfg.num_rerenders_on_reset = 2
+    env_cfg.wait_for_textures = False
+    env_cfg.seed = 42
+    env_cfg.events.reset_rings.params["randomize"] = bool(args_cli.randomize_rings)
+    print(
+        "[INFO] Ring reset mode: "
+        f"{'randomized' if args_cli.randomize_rings else 'fixed deterministic'}"
+    )
+    print(f"[INFO] Simulation device: {env_cfg.sim.device}")
+    
     isaac_env = ManagerBasedRLEnv(cfg=env_cfg)
     sm = SPARTANStateMachine(isaac_env)
     tcc = XIRLResnet18(32).to(isaac_env.device)
     
     try:
-        ckpt = torch.load("/home/aiprah/Documents/m_dVrk/Data/4001.ckpt", map_location=isaac_env.device)
+        resolved_tcc_ckpt = resolve_tcc_checkpoint(args_cli.tcc_checkpoint)
+        print(f"[INFO] Loading TCC weights from: {resolved_tcc_ckpt}")
+        ckpt = torch.load(resolved_tcc_ckpt, map_location=isaac_env.device)
         if "model" in ckpt:
             sd = ckpt["model"]
         elif "state_dict" in ckpt:
@@ -759,6 +847,7 @@ def main_eval():
     tcc.eval()
     rl_env = DVRKVisionHRLWrapper(isaac_env, sm, tcc)
     
+    # Compute goal embedding on the raw unwrapped environment first
     try:
         proc = T.Compose([T.Resize((112, 112), antialias=True)])
         rl_env.goal_embedding = compute_average_goal_embedding(tcc, proc, args_cli.dataset_path, isaac_env.device)
@@ -766,6 +855,40 @@ def main_eval():
     except Exception as e: 
         print(f"[ERR] Error computing mean goal from dataset: {e}")
         rl_env.goal_embedding = torch.zeros(32, device=isaac_env.device)
+
+    # Try to find the matching VecNormalize file and wrap the environment
+    checkpoint_path = args_cli.checkpoint
+    base_no_ext, _ = os.path.splitext(checkpoint_path)
+    
+    vec_normalize_path = None
+    possible_paths = [
+        f"{base_no_ext}_vecnormalize.pkl",
+    ]
+    # Check for step checkpoints (e.g. dvrk_ppo_1234_steps.zip)
+    dir_name = os.path.dirname(checkpoint_path)
+    base_name = os.path.basename(checkpoint_path)
+    if base_name.startswith("dvrk_ppo_") and "_steps" in base_name:
+        steps_part = base_name.replace("dvrk_ppo_", "")
+        possible_paths.append(os.path.join(dir_name, f"dvrk_ppo_vecnormalize_{steps_part.replace('.zip', '.pkl')}"))
+    
+    possible_paths.extend([
+        os.path.join(os.path.dirname(dir_name), "sb3_log_sim/vecnormalize.pkl"),
+            "/home/aiprah/Documents/m_dVrk/random_sb3_log_sim_phase_1/vecnormalize.pkl",
+        "/home/aiprah/Documents/m_dVrk/sb3_log_sim/vecnormalize.pkl"
+    ])
+    
+    for path in possible_paths:
+        if os.path.exists(path):
+            vec_normalize_path = path
+            break
+            
+    if vec_normalize_path is not None:
+        print(f"[INFO] Loading VecNormalize statistics from: {vec_normalize_path}")
+        rl_env = VecNormalize.load(vec_normalize_path, rl_env)
+        rl_env.training = False
+        rl_env.norm_reward = False
+    else:
+        print("[WARNING] No VecNormalize statistics found! Observations will not be normalized.")
 
     print(f"[INFO] Loading model from: {args_cli.checkpoint}")
     model = PPO.load(args_cli.checkpoint, env=rl_env, device="cuda")

@@ -475,25 +475,43 @@ def choose_arm(mode: str, ring_idx: int) -> str:
     return random.choice(["right_arm", "left_arm"])
 
 
-def build_commands(ring_order: str, arm_mode: str, target_peg: str, num_rings: int = 4) -> tuple[list[tuple[str, str, str]], list[str]]:
-    rings = RING_NAMES.copy()
-    if ring_order == "random":
-        random.shuffle(rings)
+def build_commands_for_env(sm, env_id: int, class_name: str, ring_order: str, arm_mode: str, target_peg: str, num_rings: int = 4) -> tuple[list[tuple[str, str, str]], list[str]]:
+    if class_name == "phase_1":
+        rings = sm.get_top_rings_on_peg(env_id, "peg_green", num_rings=4)
+        dest_pegs = ["peg_red", "peg_red", "peg_blue", "peg_blue"]
+        random.shuffle(dest_pegs)
+        
+        commands: list[tuple[str, str, str]] = []
+        for ring_idx, ring_name in enumerate(rings):
+            arm = choose_arm(arm_mode, ring_idx)
+            dest_peg = dest_pegs[ring_idx]
+            commands.extend(
+                [
+                    ("reach", arm, ring_name),
+                    ("grasp", arm, ring_name),
+                    ("reach", arm, dest_peg),
+                    ("release", arm, dest_peg),
+                ]
+            )
+        return commands, rings
+    else:
+        rings = RING_NAMES.copy()
+        if ring_order == "random":
+            random.shuffle(rings)
+        rings = rings[:num_rings]
 
-    rings = rings[:num_rings]
-
-    commands: list[tuple[str, str, str]] = []
-    for ring_idx, ring_name in enumerate(rings):
-        arm = choose_arm(arm_mode, ring_idx)
-        commands.extend(
-            [
-                ("reach", arm, ring_name),
-                ("grasp", arm, ring_name),
-                ("reach", arm, target_peg),
-                ("release", arm, target_peg),
-            ]
-        )
-    return commands, rings
+        commands: list[tuple[str, str, str]] = []
+        for ring_idx, ring_name in enumerate(rings):
+            arm = choose_arm(arm_mode, ring_idx)
+            commands.extend(
+                [
+                    ("reach", arm, ring_name),
+                    ("grasp", arm, ring_name),
+                    ("reach", arm, target_peg),
+                    ("release", arm, target_peg),
+                ]
+            )
+        return commands, rings
 
 
 def tensor_env_ids(env, ids: list[int]) -> torch.Tensor:
@@ -516,30 +534,59 @@ def save_camera_frame(env, env_id: int, slot: VideoSlot):
     slot.frame_idx += 1
 
 
-def start_video(env, sm: ScriptedStateMachine, slots, env_id: int, dataset_dir: Path, video_id: int):
+def start_video(env, sm, slots, env_id: int, dataset_dir: Path, video_id: int):
     slot = slots[env_id]
-    slot.path = dataset_dir / f"{video_id:0{max(1, args_cli.id_width)}d}"
+    slot.path = dataset_dir / f"temp_env_{env_id}"
+    if slot.path.exists():
+        shutil.rmtree(slot.path)
     slot.path.mkdir(parents=True, exist_ok=False)
-    slot.commands, slot.targeted_rings = build_commands(
-        args_cli.ring_order, args_cli.arm_mode, args_cli.target_peg, args_cli.num_rings
+
+    # Reset state machine first to establish the stacked rings positions/order
+    sm.reset_env(env_id, phase=args_cli.class_name)
+    
+    # Sync the initial state of this environment immediately to place rings in simulator
+    sync_mask = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    sync_mask[env_id] = True
+    sync_attached_and_frozen_rings(env, sm, sync_mask)
+    import omni.physx
+    omni.physx.acquire_physx_interface().update_transformations(True, True)
+    env.sim.render()
+
+    slot.commands, slot.targeted_rings = build_commands_for_env(
+        sm, env_id, args_cli.class_name, args_cli.ring_order, args_cli.arm_mode, args_cli.target_peg, args_cli.num_rings
     )
     slot.command_idx = 0
     slot.frame_idx = 0
     slot.step_idx = 0
     slot.video_id = video_id
     slot.done = False
-    sm.reset_env(env_id)
     save_camera_frame(env, env_id, slot)
     print(f"[collector] env={env_id} started video={video_id:04d} commands={len(slot.commands)}")
 
 
-def finish_video(slots, env_id: int, success: bool, reason: str, keep_failed: bool):
+def finish_video(
+    slots,
+    env_id: int,
+    success: bool,
+    reason: str,
+    keep_failed: bool,
+    target_path: Path | None = None,
+):
     slot = slots[env_id]
     if slot.path is None:
         slot.done = True
         return
 
     if success:
+        if target_path is not None and target_path != slot.path:
+            if target_path.exists():
+                shutil.rmtree(target_path)
+            slot.path.rename(target_path)
+            slot.path = target_path
+            try:
+                slot.video_id = int(target_path.name)
+            except ValueError:
+                pass
         print(
             f"[collector] env={env_id} video={slot.video_id:04d} saved "
             f"frames={slot.frame_idx} steps={slot.step_idx}"
@@ -547,7 +594,7 @@ def finish_video(slots, env_id: int, success: bool, reason: str, keep_failed: bo
     else:
         print(f"[collector] env={env_id} video={slot.video_id:04d} failed: {reason}")
         if keep_failed:
-            failed_path = slot.path.with_name(f"failed_{slot.path.name}")
+            failed_path = slot.path.parent / f"failed_{slot.video_id:0{max(1, args_cli.id_width)}d}"
             if failed_path.exists():
                 shutil.rmtree(failed_path)
             slot.path.rename(failed_path)
@@ -577,12 +624,15 @@ def maybe_issue_next_command(sm: ScriptedStateMachine, slots, env_id: int):
 
 
 def main():
+    if args_cli.class_name == "phase_1":
+        args_cli.num_rings = 4
     random.seed(args_cli.seed)
     torch.manual_seed(args_cli.seed)
 
     dataset_dir = Path(args_cli.output_root) / args_cli.split / args_cli.class_name
     dataset_dir.mkdir(parents=True, exist_ok=True)
     next_id = next_video_index(dataset_dir, args_cli.start_index)
+    save_id = next_id
 
     env_cfg = MDvrkEnvCfg()
     env_cfg.scene.num_envs = args_cli.num_envs
@@ -603,7 +653,7 @@ def main():
     sm = ScriptedStateMachine(env)
     env.reset()
     for env_id in range(env.num_envs):
-        sm.reset_env(env_id)
+        sm.reset_env(env_id, phase=args_cli.class_name)
 
     slots = [VideoSlot() for _ in range(env.num_envs)]
     successful_videos = 0
@@ -641,7 +691,7 @@ def main():
             if bool(isaac_done[env_id].item()):
                 reason = "terminated" if bool(terminated[env_id].item()) else "time_out"
                 finish_video(slots, env_id, success=False, reason=reason, keep_failed=args_cli.keep_failed)
-                sm.reset_env(env_id)
+                sm.reset_env(env_id, phase=args_cli.class_name)
                 reset_ids.append(env_id)
                 continue
 
@@ -654,27 +704,32 @@ def main():
                 continue
 
             if slot.command_idx >= len(slot.commands) and sm.all_idle(env_id):
-                success = all(
-                    sm.frozen_rings_mask[ring_name][env_id]
-                    and sm.ring_support_peg[ring_name][env_id] == args_cli.target_peg
-                    for ring_name in slot.targeted_rings
-                )
+                success = sm.successful(env_id, phase=args_cli.class_name)
+                target_path = None
                 if success:
                     save_camera_frame(env, env_id, slot)
+                    target_path = dataset_dir / f"{save_id:0{max(1, args_cli.id_width)}d}"
+                    save_id += 1
                     successful_videos += 1
                 finish_video(
                     slots,
                     env_id,
                     success=success,
-                    reason=f"rings_placed={len(slot.targeted_rings)}",
+                    reason=(
+                        f"red={sm.ring_count_on_peg(env_id, 'peg_red')} "
+                        f"blue={sm.ring_count_on_peg(env_id, 'peg_blue')}"
+                        if args_cli.class_name == "phase_1"
+                        else f"rings_placed={len(slot.targeted_rings)}"
+                    ),
                     keep_failed=args_cli.keep_failed,
+                    target_path=target_path,
                 )
                 reset_ids.append(env_id)
 
         if reset_ids:
             env.reset(env_ids=tensor_env_ids(env, reset_ids))
             for env_id in reset_ids:
-                sm.reset_env(env_id)
+                sm.reset_env(env_id, phase=args_cli.class_name)
 
         free_ids = [i for i, slot in enumerate(slots) if slot.done]
         for env_id in free_ids:

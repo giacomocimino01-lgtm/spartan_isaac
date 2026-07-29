@@ -8,7 +8,7 @@ import numpy as np
 from datetime import datetime
 
 # Read CSV
-csv_file = 'sb3_log_sim/progress.csv'
+csv_file = 'random_sb3_log_sim_phase_1_bc_raw_no_norm_300k/progress.csv'
 df = pd.read_csv(csv_file)
 
 # Clean up - remove rows where ep_rew_mean is NaN
@@ -101,8 +101,8 @@ ax5.text(0.01, 0.99, stats_text, transform=ax5.transAxes, fontsize=10,
 plt.suptitle(f'Training Analysis Report - Generated {datetime.now().strftime("%Y-%m-%d %H:%M")}',
             fontsize=15, fontweight='bold', y=0.995)
 
-plt.savefig('sb3_log_sim/training_analysis_report.png', dpi=150, bbox_inches='tight')
-print("✓ Comprehensive report saved to: sb3_log_sim/training_analysis_report.png")
+plt.savefig('random_sb3_log_sim_phase_1/training_analysis_report.png', dpi=150, bbox_inches='tight')
+print("✓ Comprehensive report saved to: random_sb3_log_sim_phase_1/training_analysis_report.png")
 
 # Print key findings
 print("\n" + "="*60)

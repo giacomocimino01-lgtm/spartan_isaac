@@ -87,12 +87,22 @@ tests/
 *.usdz
 *.mp4
 *.hdf5
+*.npz
+*.npy
+*.pkl
 *.png
 *.txt
 *.pdf
+*.md
+/presentazione_marp.html
+*.zip
+*.tfevents.*
 
 # Blocca cartelle specifiche
 /reward_debug_frames
+/success_snapshots
+/success_videos
+/video_raccolti
 /modelli_salvati
 /modelli_salvati1
 /modelli_salvati_sim
@@ -103,6 +113,14 @@ tests/
 /Data
 /sb3_log
 /sb3_log_sim
+/random_sb3_log_sim
+/random_sb3_log_sim_phase_*
 /tensorboard_logs
 /${data}
 /scripts/video
+/.venv
+/artifacts/datasets
+/artifacts/checkpoints
+/artifacts/logs
+/artifacts/videos
+/artifacts/snapshots

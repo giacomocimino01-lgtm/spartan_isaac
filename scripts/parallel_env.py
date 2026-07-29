@@ -685,6 +685,7 @@ training entrypoints that bootstrap Isaac Sim at import time.
 
 from __future__ import annotations
 
+import random
 import torch
 
 import isaaclab.utils.math as math_utils
@@ -756,10 +757,10 @@ class SPARTANStateMachine:
     Z_TABLE = 0.717
     SAFE_Z_OFFSET = 0.015
     GRASP_Z_OFFSET = 0.005
-    GRASP_ATTACH_DISTANCE = 0.06
+    GRASP_ATTACH_DISTANCE = 0.015
     GRASP_CLOSE_MIN_STEPS = 10
     GRASP_TIMEOUT_STEPS = 220
-    RELEASE_PEG_CAPTURE_DISTANCE = 0.03
+    RELEASE_PEG_CAPTURE_DISTANCE = 0.015
     BOARD_RELEASE_Z_OFFSET = 0.0
     LINEAR_SPEED = 0.02
     REACH_ENTRY_X = 0.375
@@ -997,7 +998,7 @@ class SPARTANStateMachine:
 
         self._sync_peg_inventory(env_id, peg_name)
 
-    def reset_env(self, env_id: int):
+    def reset_env(self, env_id: int, phase: str = "phase_0"):
         self.current_triplet_r[env_id] = None
         self.current_triplet_l[env_id] = None
 
@@ -1031,7 +1032,35 @@ class SPARTANStateMachine:
             self.frozen_rings_pose[ring][env_id] = 0.0
             self._clear_ring_support(ring, env_id)
 
-        print(f"[ENV {env_id}] Reset completo. Stato macchina a stati reimpostato.")
+        if phase == "phase_1":
+            # Stack all 4 rings on peg_green in a randomized order
+            rings_to_stack = RING_NAMES.copy()
+            random.shuffle(rings_to_stack)
+            peg_pos_w = self._get_cached_peg_position_w("peg_green", env_id)
+            if peg_pos_w is None:
+                peg_pos_w = _get_scene_entity_position_w(self.env, "peg_green", env_id)
+            
+            for idx, ring_name in enumerate(rings_to_stack):
+                release_pos = peg_pos_w.clone()
+                release_pos[2] = self.Z_TABLE + self.env.scene.env_origins[env_id, 2] + (idx * self.RING_THICKNESS)
+                self.frozen_rings_mask[ring_name][env_id] = True
+                self.frozen_rings_pose[ring_name][env_id, 0:3] = release_pos
+                self.frozen_rings_pose[ring_name][env_id, 3:7] = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device)
+                self.ring_support_peg[ring_name][env_id] = "peg_green"
+                self.ring_stack_level[ring_name][env_id] = idx
+                
+            self._sync_peg_inventory(env_id, "peg_green")
+
+        print(f"[ENV {env_id}] Reset completo ({phase}). Stato macchina a stati reimpostato.")
+
+    def get_top_rings_on_peg(self, env_id: int, peg_name: str, num_rings: int = 2) -> list[str]:
+        rings_on_peg = []
+        for ring_name in RING_NAMES:
+            if self.ring_support_peg[ring_name][env_id] == peg_name and self.frozen_rings_mask[ring_name][env_id]:
+                rings_on_peg.append((ring_name, int(self.ring_stack_level[ring_name][env_id].item())))
+        # Sort by stack level descending (top first)
+        rings_on_peg.sort(key=lambda x: x[1], reverse=True)
+        return [r[0] for r in rings_on_peg[:num_rings]]
 
     def arm_idle(self, env_id: int, arm: str) -> bool:
         if arm == "right_arm":
@@ -1322,12 +1351,18 @@ class SPARTANStateMachine:
     def green_peg_ring_count(self, env_id: int) -> int:
         return self._count_rings_on_peg(env_id, "peg_green")
 
-    def successful(self, env_id: int, target_peg: str) -> bool:
-        return all(
-            self.frozen_rings_mask[ring_name][env_id]
-            and self.ring_support_peg[ring_name][env_id] == target_peg
-            for ring_name in RING_NAMES
-        )
+    def successful(self, env_id: int, phase: str = "phase_0", target_peg: str = "peg_green") -> bool:
+        if phase == "phase_1":
+            red_count = self._count_rings_on_peg(env_id, "peg_red")
+            blue_count = self._count_rings_on_peg(env_id, "peg_blue")
+            all_frozen = all(self.frozen_rings_mask[ring_name][env_id] for ring_name in RING_NAMES)
+            return all_frozen and red_count == 2 and blue_count == 2
+        else:
+            return all(
+                self.frozen_rings_mask[ring_name][env_id]
+                and self.ring_support_peg[ring_name][env_id] == target_peg
+                for ring_name in RING_NAMES
+            )
 
 
 def sync_attached_and_frozen_rings(env, sm: SPARTANStateMachine, active_env_mask: torch.Tensor):

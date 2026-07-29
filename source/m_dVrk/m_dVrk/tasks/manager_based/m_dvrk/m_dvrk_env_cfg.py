@@ -439,15 +439,16 @@ class TerminationsCfg:
 
     # (2) Ring out of workspace (local frame for each env)
     # The PegBoard is at (0.375, -0.05, 0.71): ±10cm around the center
-    ring_out_of_bounds = DoneTerm(
-        func=mdp.ring_out_of_bounds,
-        params={
-            "ring_names": ["ring_red", "ring_yellow", "ring_green", "ring_blue"],
-            "x_bounds": (0.28, 0.47),
-            "y_bounds": (-0.16, 0.06),
-            "z_min": 0.69,
-        },
-    )
+    # ring_out_of_bounds = DoneTerm(
+    #     func=mdp.ring_out_of_bounds,
+    #     params={
+    #         "ring_names": ["ring_red", "ring_yellow", "ring_green", "ring_blue"],
+    #         "x_bounds": (0.28, 0.47),
+    #         "y_bounds": (-0.16, 0.06),
+    #         "z_min": 0.69,
+    #     },
+    # )
+
 
 
 ##

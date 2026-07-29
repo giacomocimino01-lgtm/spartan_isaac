@@ -13,8 +13,9 @@ import torch.nn as nn
 import torchvision.models as models
 import torchvision.transforms as T
 import torchvision.io as io
+torch.cuda.empty_cache()
 
-from app_launcher_utils import pin_process_to_requested_cuda_device
+from app_launcher_utils import pin_process_to_requested_cuda_device, resolve_tcc_checkpoint
 import gymnasium as gym
 from gymnasium import spaces
 from stable_baselines3 import PPO
@@ -34,6 +35,60 @@ parser.add_argument(
     action="store_true",
     help="Randomize ring reset positions. By default, rings reset to a fixed deterministic layout.",
 )
+parser.add_argument(
+    "--pretrained_checkpoint",
+    type=str,
+    default=None,
+    help="Path to a zip file of a pre-trained PPO policy (Behavior Cloning).",
+)
+parser.add_argument(
+    "--freeze_policy_timesteps",
+    type=int,
+    default=1500000,
+    help="Number of timesteps to freeze the policy (actor) weights at the beginning of training (to train the critic first).",
+)
+parser.add_argument(
+    "--task_phase",
+    type=str,
+    default="phase_0",
+    choices=["phase_0", "phase_1"],
+    help="Goal phase of the task. 'phase_0' places 4 rings on the green peg, 'phase_1' places 2 on red and 2 on blue (starting stacked on green).",
+)
+parser.add_argument(
+    "--goal_dataset_root",
+    type=str,
+    default="/mnt/data/aiprah/data/sim_dataset_xirl_extra",
+    help="Root directory of the dataset used to compute the goal embedding.",
+)
+parser.add_argument(
+    "--disable_obs_normalization",
+    action="store_true",
+    help="Disable VecNormalize observation normalization. Useful for raw-observation BC checkpoint checks.",
+)
+parser.add_argument(
+    "--total_timesteps",
+    type=int,
+    default=5_000_000,
+    help="Total PPO training timesteps. Use a small value for ablations.",
+)
+parser.add_argument(
+    "--learning_rate",
+    type=float,
+    default=3e-4,
+    help="PPO learning rate. Lower values are useful when fine-tuning a BC-pretrained actor.",
+)
+parser.add_argument(
+    "--ent_coef",
+    type=float,
+    default=0.015,
+    help="PPO entropy coefficient. Lower values reduce exploration pressure after BC pretraining.",
+)
+parser.add_argument(
+    "--log_suffix",
+    type=str,
+    default="",
+    help="Optional suffix appended to the PPO log directory and checkpoint names.",
+)
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 requested_device = getattr(args_cli, "device", None)
@@ -43,6 +98,11 @@ if requested_device != args_cli.device and requested_device is not None and "cud
         f"[INFO] Remapped device {requested_device} -> {args_cli.device} "
         f"with CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')}"
     )
+
+# The camera sensor requires Isaac rendering to be enabled.
+if not getattr(args_cli, "enable_cameras", False):
+    args_cli.enable_cameras = True
+
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
@@ -50,7 +110,7 @@ from isaaclab.envs import ManagerBasedRLEnv
 from m_dVrk.tasks.manager_based.m_dvrk.m_dvrk_env_cfg import MDvrkEnvCfg 
 
 import torch.nn.functional as F
-from parallel_env import SPARTANStateMachine, get_scene_entity_positions_w
+from parallel_env import SPARTANStateMachine, get_scene_entity_positions_w, sync_attached_and_frozen_rings
 
 VERB_MAP = {0: "reach", 1: "grasp", 2: "release", 3: "idle"}
 TARGET_MAP = {
@@ -85,6 +145,13 @@ EPISODE_CSV_FILENAME = "episode_progress.csv"
 INVALID_COMMAND_PENALTY = 1.0
 BEST_TERMINAL_DISTANCE_WINDOW_EPISODES = 10
 BEST_TERMINAL_DISTANCE_PREFIX = "dvrk_ppo_best_terminal_distance"
+
+# --- Success snapshot / video dump ---
+SUCCESS_SNAPSHOT_PROB    = 0.10   # 10%: salva uno screenshot PNG ad ogni successo
+SUCCESS_VIDEO_PROB       = 0.02   # 2%:  salva un video MP4 dell'episodio di successo
+SUCCESS_DUMP_DIR         = "success_snapshots"
+SUCCESS_VIDEO_DIR        = "success_videos"
+SUCCESS_VIDEO_FRAME_SKIP = 5      # Accumula 1 frame ogni N step nel buffer video
 
 # ==========================================
 # CLASSE XIRL: CLONE DELLA RETE PRE-TRAINATA
@@ -125,10 +192,11 @@ class XIRLResnet18(nn.Module):
 # CLASSE 1.5: IL WRAPPER RL VETTORIZZATO (Eredita da VecEnv!)
 # ==========================================
 class DVRKVisionHRLWrapper(VecEnv):
-    def __init__(self, isaac_env, state_machine, tcc_model=None):
+    def __init__(self, isaac_env, state_machine, tcc_model=None, task_phase="phase_0"):
         self.env = isaac_env
         self.sm = state_machine
         self.tcc_model = tcc_model
+        self.task_phase = task_phase
         
         self.num_envs = isaac_env.num_envs
         self.stack_size = 3                 
@@ -139,7 +207,7 @@ class DVRKVisionHRLWrapper(VecEnv):
         
         # OBSERVATION SPACE: [emb_stack (stack_size*emb_dim), aux_info (62)]
         self.aux_dim = 62
-        self.geom_dim = 82
+        self.geom_dim = 86
         self.obs_dim = self.stack_size * self.emb_dim + self.aux_dim + self.geom_dim
 
         obs_space = spaces.Box(
@@ -166,6 +234,29 @@ class DVRKVisionHRLWrapper(VecEnv):
                 f"[RewardDebug] Dump attivo: every={self.reward_debug_dump_interval} step, "
                 f"envs={self.reward_debug_dump_env_ids}, dir={self.reward_debug_dump_dir}"
             )
+
+        # --- Success snapshot / video dump ---
+        self.success_snapshot_prob    = SUCCESS_SNAPSHOT_PROB
+        self.success_video_prob       = SUCCESS_VIDEO_PROB
+        self.success_dump_dir         = SUCCESS_DUMP_DIR
+        self.success_video_dir        = SUCCESS_VIDEO_DIR
+        self.success_video_frame_skip = SUCCESS_VIDEO_FRAME_SKIP
+        # Frame buffer per ogni env: lista di tensor (H, W, 3) uint8 su CPU
+        self._success_frame_buffers   = [[] for _ in range(self.num_envs)]
+        self._ep_step_for_video       = [0] * self.num_envs   # contatore step locale per il frame-skip
+        os.makedirs(self.success_dump_dir, exist_ok=True)
+        os.makedirs(self.success_video_dir, exist_ok=True)
+        print(
+            f"[SuccessDump] snapshot_prob={self.success_snapshot_prob:.0%}, "
+            f"video_prob={self.success_video_prob:.0%}, "
+            f"frame_skip={self.success_video_frame_skip}"
+        )
+
+        # Number of idle steps to run after task completion before declaring success.
+        # This allows the rendering pipeline to propagate ring positions written via
+        # write_root_state_to_sim to the visual/camera buffer.
+        self.SETTLE_STEPS = 5
+        self.settle_steps_remaining = torch.zeros(self.num_envs, dtype=torch.long, device=self.env.device)
 
         # We need to keep stored the last action to feed it into the state machine logic
         self.prev_actions = IDLE_ACTION.to(self.env.device).unsqueeze(0).repeat(self.num_envs, 1)
@@ -253,6 +344,50 @@ class DVRKVisionHRLWrapper(VecEnv):
 
         return out
 
+    def _get_manipulable_rings_mask(self) -> torch.Tensor:
+        """Restituisce una maschera (num_envs, 4) con 1.0 se l'anello è manipolabile, 0.0 altrimenti."""
+        device = self.env.device
+        manipulable_mask = torch.zeros((self.num_envs, 4), dtype=torch.float32, device=device)
+
+        for env_i in range(self.num_envs):
+            for ring_idx, ring_name in enumerate(self._ring_names):
+                # 1. Se è già impugnato dal braccio sinistro o destro, non occorre fare re-grasp
+                if (self.sm.attached_target_l[env_i] == ring_name or
+                    self.sm.attached_target_r[env_i] == ring_name):
+                    continue
+
+                # 2. Verifichiamo la posizione dell'anello rispetto ai pioli
+                current_peg = self.sm.ring_support_peg.get(ring_name, [None] * self.num_envs)[env_i]
+
+                if current_peg is not None and current_peg != "None":
+                    # Un ring frozen su un peg finale è già piazzato. In phase1, però,
+                    # i ring partono frozen su peg_green e devono essere presi se top.
+                    placed_on_final_peg = (
+                        (self.task_phase == "phase_0" and current_peg == "peg_green")
+                        or (self.task_phase == "phase_1" and current_peg in {"peg_red", "peg_blue"})
+                    )
+                    if self.sm.frozen_rings_mask[ring_name][env_i] and placed_on_final_peg:
+                        continue
+
+                    # L'anello è su un piolo: è manipolabile SOLO se è in cima.
+                    top_rings = self.sm.get_top_rings_on_peg(env_i, current_peg, num_rings=1)
+                    top_ring = top_rings[0] if top_rings else None
+                    if top_ring == ring_name:
+                        manipulable_mask[env_i, ring_idx] = 1.0
+                else:
+                    if self.sm.frozen_rings_mask[ring_name][env_i]:
+                        continue
+                    # L'anello NON è su un piolo (è libero nel workspace/tavolo)
+                    ring_pos_w = get_scene_entity_positions_w(self.env, ring_name)[env_i]
+                    origin_w = self.env.scene.env_origins[env_i]
+                    rel_pos = ring_pos_w - origin_w  # Posizione locale [x, y, z]
+
+                    in_workspace = (rel_pos[2] > -0.1) and (torch.norm(rel_pos[:2]) < 0.45)
+                    if in_workspace:
+                        manipulable_mask[env_i, ring_idx] = 1.0
+
+        return manipulable_mask
+
     def _get_aux_obs(self):
         """
         62 dims:
@@ -319,7 +454,8 @@ class DVRKVisionHRLWrapper(VecEnv):
             attached flags                       8
             frozen flags                         4
             peg inventory                        4
-        Total:                                  82
+            manipulable flags                    4
+        Total:                                  86
         """
         device = self.env.device
         origins = self.env.scene.env_origins  # (N, 3)
@@ -369,6 +505,8 @@ class DVRKVisionHRLWrapper(VecEnv):
             dim=1,
         ) / 4.0
 
+        manipulable_mask = self._get_manipulable_rings_mask()
+
         geom = torch.cat(
             [
                 tip_r,
@@ -382,26 +520,39 @@ class DVRKVisionHRLWrapper(VecEnv):
                 attached_l,
                 frozen,
                 inventory,
+                manipulable_mask,
             ],
             dim=1,
         )
 
-        assert geom.shape[1] == 82, f"Expected geom obs dim 82, got {geom.shape[1]}"
+        assert geom.shape[1] == 86, f"Expected geom obs dim 86, got {geom.shape[1]}"
         return geom
 
-    def _green_peg_ring_count(self):
+    def _peg_ring_count(self, peg_name):
         counts = torch.zeros(self.num_envs, dtype=torch.long, device=self.env.device)
         for ring_name in ["ring_red", "ring_yellow", "ring_green", "ring_blue"]:
-            on_green = torch.tensor(
-                [self.sm.ring_support_peg[ring_name][i] == "peg_green" for i in range(self.num_envs)],
+            on_peg = torch.tensor(
+                [self.sm.ring_support_peg[ring_name][i] == peg_name for i in range(self.num_envs)],
                 dtype=torch.bool,
                 device=self.env.device,
             )
-            counts += (self.sm.frozen_rings_mask[ring_name] & on_green).long()
+            counts += (self.sm.frozen_rings_mask[ring_name] & on_peg).long()
         return counts
 
+    def _green_peg_ring_count(self):
+        return self._peg_ring_count("peg_green")
+
     def _task_success(self):
-        return self._green_peg_ring_count() == 4
+        if self.task_phase == "phase_1":
+            red_count = self._peg_ring_count("peg_red")
+            blue_count = self._peg_ring_count("peg_blue")
+            all_frozen = torch.stack(
+                [self.sm.frozen_rings_mask[name] for name in ["ring_red", "ring_yellow", "ring_green", "ring_blue"]],
+                dim=1
+            ).all(dim=1)
+            return all_frozen & (red_count == 2) & (blue_count == 2)
+        else:
+            return self._peg_ring_count("peg_green") == 4
 
     def _write_debug_png(self, img_tensor, out_path):
         img_u8 = torch.clamp(img_tensor.detach().cpu(), 0.0, 1.0)
@@ -465,7 +616,10 @@ class DVRKVisionHRLWrapper(VecEnv):
         self.current_step[:] = 0
 
         for i in range(self.num_envs):
-            self.sm.reset_env(i)
+            self.sm.reset_env(i, phase=self.task_phase)
+
+        # Sync attached/frozen rings so they show up at their correct initial stacked/frozen poses
+        sync_attached_and_frozen_rings(self.env, self.sm, torch.ones(self.num_envs, dtype=torch.bool, device=self.env.device))
 
         self.prev_actions[:] = IDLE_ACTION.to(self.env.device).unsqueeze(0)
         self.last_override_flags.zero_()
@@ -481,18 +635,26 @@ class DVRKVisionHRLWrapper(VecEnv):
     def step_async(self, actions):
         self.actions = actions
 
-    def _sanitize_arm_command(self, verb: str, target: str):
+    def _sanitize_arm_command(self, env_id: int, verb: str, target: str, manipulable_mask: torch.Tensor):
         if verb == "idle":
             return "idle", "None", False
 
-        if verb == "grasp" and target not in RING_TARGETS:
+        if target == "None":
             return "idle", "None", True
+
+        if verb == "grasp":
+            if target not in RING_TARGETS:
+                return "idle", "None", True
+
+            current_peg = self.sm.ring_support_peg.get(target, [None] * self.num_envs)[env_id]
+            if current_peg is not None and current_peg != "None":
+                top_rings = self.sm.get_top_rings_on_peg(env_id, current_peg, num_rings=1)
+                top_ring = top_rings[0] if top_rings else None
+                if top_ring != target:
+                    return "idle", "None", True
 
         if verb == "release":
             return verb, target, False
-
-        if target == "None":
-            return "idle", "None", True
 
         return verb, target, False
 
@@ -515,6 +677,7 @@ class DVRKVisionHRLWrapper(VecEnv):
             dtype=torch.float32,
             device=self.env.device,
         )
+        manipulable_masks = self._get_manipulable_rings_mask()
 
         for i in range(self.num_envs):
             was_busy_l = self.sm.sub_state_l[i] != "IDLE"
@@ -526,8 +689,8 @@ class DVRKVisionHRLWrapper(VecEnv):
             verb_l, tgt_l = VERB_MAP[int(actions[i, 0])], TARGET_MAP[int(actions[i, 1])]
             verb_r, tgt_r = VERB_MAP[int(actions[i, 2])], TARGET_MAP[int(actions[i, 3])]
 
-            verb_l, tgt_l, invalid_l = self._sanitize_arm_command(verb_l, tgt_l)
-            verb_r, tgt_r, invalid_r = self._sanitize_arm_command(verb_r,tgt_r)
+            verb_l, tgt_l, invalid_l = self._sanitize_arm_command(i, verb_l, tgt_l, manipulable_masks[i])
+            verb_r, tgt_r, invalid_r = self._sanitize_arm_command(i, verb_r, tgt_r, manipulable_masks[i])
 
             sanitized_actions[i, 0] = VERB_TO_ID[verb_l]
             sanitized_actions[i, 1] = TARGET_TO_ID[tgt_l]
@@ -622,6 +785,10 @@ class DVRKVisionHRLWrapper(VecEnv):
         new_embs = self._get_batched_embeddings(dump_debug=True) 
         self.emb_buffer = torch.roll(self.emb_buffer, shifts=-1, dims=1)
         self.emb_buffer[:, -1, :] = new_embs
+
+        # Accumula frame nel buffer video (su CPU, campionamento ogni N step)
+        rgb_data = self.env.scene.sensors["camera"].data.output["rgb"]
+        self._accumulate_success_frames(rgb_data)
         
         step0 = self.current_step[0].item()
         if step0 % 10 == 0:
@@ -649,8 +816,22 @@ class DVRKVisionHRLWrapper(VecEnv):
         rewards -= invalid_command_counts * INVALID_COMMAND_PENALTY
 
         green_peg_ring_count = self._green_peg_ring_count()
-        task_success = green_peg_ring_count == 4
+        rings_complete = self._task_success()
+        # Start settle countdown when all rings are on the target peg
+        just_completed = rings_complete & (self.settle_steps_remaining == 0)
+        self.settle_steps_remaining[just_completed] = self.SETTLE_STEPS
+        # Decrement active countdowns
+        settling = self.settle_steps_remaining > 0
+        self.settle_steps_remaining[settling] -= 1
+        # Prefer the settled visual state, but do not turn a logically complete
+        # task into a failure just because Isaac time limit fired first.
+        settled_success = rings_complete & (self.settle_steps_remaining == 0)
+        task_success = settled_success | (rings_complete & isaac_done)
         # ------------------------------
+
+        # Snapshot / video dei successi (prima del reset)
+        if task_success.any():
+            self._maybe_dump_success_assets(task_success, rgb_data)
 
         # --------------------------------------------------
         # Done flags
@@ -675,8 +856,12 @@ class DVRKVisionHRLWrapper(VecEnv):
             infos[idx]["terminal_observation"] = terminal_obs[idx].copy()
             infos[idx]["TimeLimit.truncated"] = bool(truncated_np[idx] and not terminated_np[idx])
             infos[idx]["is_success"] = bool(task_success[idx].item())
+            infos[idx]["rings_complete"] = bool(rings_complete[idx].item())
             infos[idx]["terminal_distance"] = float(rew_distance_raw[idx].item())
             infos[idx]["green_peg_ring_count"] = int(green_peg_ring_count[idx].item())
+            if self.task_phase == "phase_1":
+                infos[idx]["red_peg_ring_count"] = int(self._peg_ring_count("peg_red")[idx].item())
+                infos[idx]["blue_peg_ring_count"] = int(self._peg_ring_count("peg_blue")[idx].item())
 
         # --------------------------------------------------
         # Manual reset for non-Isaac terminal conditions
@@ -701,11 +886,22 @@ class DVRKVisionHRLWrapper(VecEnv):
                     f"Distance={rew_distance_raw[idx].item():.4f}. Resetting environment."
                 )
 
-                self.sm.reset_env(idx)
+                self.sm.reset_env(idx, phase=self.task_phase)
                 self.current_step[idx] = 0
+                self.settle_steps_remaining[idx] = 0
 
                 self.prev_actions[idx] = IDLE_ACTION.to(self.env.device)
                 self.last_override_flags[idx] = 0.0
+
+                # Pulisci buffer frame dell'episodio appena concluso
+                self._success_frame_buffers[idx].clear()
+                self._ep_step_for_video[idx] = 0
+
+            # Sync newly reset environments
+            sync_mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self.env.device)
+            for idx in done_ids:
+                sync_mask[idx] = True
+            sync_attached_and_frozen_rings(self.env, self.sm, sync_mask)
 
             # Refill embedding stack AFTER reset, not with zeros.
             reset_embs = self._get_batched_embeddings()
@@ -740,6 +936,57 @@ class DVRKVisionHRLWrapper(VecEnv):
         return [False] * n
     
     def close(self): pass
+
+    # ------------------------------------------------------------------
+    # Success snapshot / video helpers
+    # ------------------------------------------------------------------
+
+    def _accumulate_success_frames(self, rgb_data: torch.Tensor):
+        """Accumula i frame RGB nel buffer video di ogni env (campionamento a frame_skip)."""
+        for idx in range(self.num_envs):
+            self._ep_step_for_video[idx] += 1
+            if self._ep_step_for_video[idx] % self.success_video_frame_skip != 0:
+                continue
+            # Estrai frame (H, W, 3) uint8 su CPU — .clone() è ESSENZIALE:
+            # camera.data.output["rgb"] è un buffer aggiornato in-place da IsaacLab;
+            # senza clone() tutti i frame del buffer punterebbero alla stessa memoria.
+            frame = rgb_data[idx, :, :, :3].clone().cpu().to(torch.uint8)
+            self._success_frame_buffers[idx].append(frame)
+
+    def _maybe_dump_success_assets(
+        self,
+        task_success: torch.Tensor,
+        rgb_data: torch.Tensor,
+    ):
+        """Per ogni env con successo, salva probabilisticamente PNG e/o MP4."""
+        for idx in task_success.nonzero(as_tuple=False).flatten().tolist():
+            ts = int(self.current_step[idx].item())
+            tag = f"env{idx:03d}_step{ts:06d}"
+
+            # --- Screenshot ---
+            if random.random() < self.success_snapshot_prob:
+                try:
+                    # .clone() per non dipendere dal buffer in-place della camera
+                    frame = rgb_data[idx, :, :, :3].clone().cpu().to(torch.uint8).permute(2, 0, 1)  # (3, H, W)
+                    png_path = os.path.join(self.success_dump_dir, f"success_{tag}.png")
+                    io.write_png(frame, png_path)
+                    print(f"[SuccessDump] Screenshot salvato: {png_path}", flush=True)
+                except Exception as exc:
+                    print(f"[SuccessDump] Errore screenshot env {idx}: {exc}", flush=True)
+
+            # --- Video ---
+            if random.random() < self.success_video_prob:
+                frames = self._success_frame_buffers[idx]
+                if len(frames) >= 2:
+                    try:
+                        # (T, H, W, 3) uint8
+                        video_tensor = torch.stack(frames, dim=0)
+                        mp4_path = os.path.join(self.success_video_dir, f"success_{tag}.mp4")
+                        # fps effettivo ≈ sim_fps / decimation / frame_skip
+                        io.write_video(mp4_path, video_tensor, fps=10)
+                        print(f"[SuccessDump] Video salvato: {mp4_path} ({len(frames)} frames)", flush=True)
+                    except Exception as exc:
+                        print(f"[SuccessDump] Errore video env {idx}: {exc}", flush=True)
 
 def compute_average_goal_embedding(tcc_model, preprocess, dataset_path, device):
     embeddings = []
@@ -817,8 +1064,11 @@ class EpisodeCsvLoggerCallback(BaseCallback):
                 "episode_length",
                 "episode_time_seconds",
                 "is_success",
+                "rings_complete",
                 "terminal_distance",
                 "green_peg_ring_count",
+                "red_peg_ring_count",
+                "blue_peg_ring_count",
                 "time_limit_truncated",
             ],
         )
@@ -845,8 +1095,11 @@ class EpisodeCsvLoggerCallback(BaseCallback):
                     "episode_length": int(episode.get("l", 0)),
                     "episode_time_seconds": float(episode.get("t", 0.0)),
                     "is_success": bool(info.get("is_success", False)),
+                    "rings_complete": bool(info.get("rings_complete", False)),
                     "terminal_distance": float(info.get("terminal_distance", float("nan"))),
                     "green_peg_ring_count": int(info.get("green_peg_ring_count", 0)),
+                    "red_peg_ring_count": int(info.get("red_peg_ring_count", 0)),
+                    "blue_peg_ring_count": int(info.get("blue_peg_ring_count", 0)),
                     "time_limit_truncated": bool(info.get("TimeLimit.truncated", False)),
                 }
             )
@@ -931,6 +1184,47 @@ class BestTerminalDistanceCheckpointCallback(BaseCallback):
 
         return True
 
+class FreezePolicyCallback(BaseCallback):
+    def __init__(self, freeze_timesteps: int, verbose: int = 0):
+        super().__init__(verbose)
+        self.freeze_timesteps = freeze_timesteps
+        self.policy_frozen = False
+
+    def _on_training_start(self) -> None:
+        if self.freeze_timesteps > 0:
+            self.freeze_policy()
+
+    def _on_step(self) -> bool:
+        if self.policy_frozen and self.num_timesteps >= self.freeze_timesteps:
+            self.unfreeze_policy()
+        return True
+
+    def freeze_policy(self) -> None:
+        print(f"[PPO] Freezing policy (actor) parameters for the first {self.freeze_timesteps} timesteps.", flush=True)
+        freeze_count = 0
+        freeze_params_names = []
+        for name, param in self.model.policy.named_parameters():
+            if "policy_net" in name or "action_net" in name:
+                param.requires_grad = False
+                param.grad = None
+                freeze_count += 1
+                freeze_params_names.append(name)
+        print(f"[PPO] Froze {freeze_count} parameters:", flush=True)
+        for pname in freeze_params_names:
+            print(f"      - {pname}", flush=True)
+        self.policy_frozen = True
+
+    def unfreeze_policy(self) -> None:
+        print(f"[PPO] Unfreezing policy (actor) parameters after {self.num_timesteps} timesteps.", flush=True)
+        unfreeze_count = 0
+        for name, param in self.model.policy.named_parameters():
+            if "policy_net" in name or "action_net" in name:
+                param.requires_grad = True
+                unfreeze_count += 1
+        print(f"[PPO] Unfroze {unfreeze_count} parameters.", flush=True)
+        self.policy_frozen = False
+
+
 # ==========================================
 # TRAINING MAIN
 # ==========================================
@@ -974,8 +1268,11 @@ def main_train():
     tcc = XIRLResnet18(embedding_size=32).to(isaac_env.device)
 
     try:
+        experiment_dir = f"/home/aiprah/Documents/tmp/xirl/sim_pretrain_runs/random_sim_{args_cli.task_phase.replace('_', '')}_tcc"
+        tcc_ckpt_path = resolve_tcc_checkpoint(experiment_dir)
+        print(f"[INFO] Loading XIRL weights from: {tcc_ckpt_path}")
         ckpt = torch.load(
-            "/tmp/xirl/sim_pretrain_runs/200_sim_phase0_tcc/checkpoints/4001.ckpt",
+            tcc_ckpt_path,
             map_location=isaac_env.device,
         )
 
@@ -1007,33 +1304,45 @@ def main_train():
 
     tcc.eval()
 
-    rl_env = DVRKVisionHRLWrapper(isaac_env, sm, tcc)
+    rl_env = DVRKVisionHRLWrapper(isaac_env, sm, tcc, task_phase=args_cli.task_phase)
     
     try:
-        dataset_path = "/mnt/data/aiprah/data/sim_dataset_xirl_extra/train/phase_0/"
+        dataset_path = f"{args_cli.goal_dataset_root}/train/{args_cli.task_phase}/"
+        print(f"[INFO] Computing goal embedding from dataset path: {dataset_path}")
         proc = T.Compose([T.Resize((112, 112), antialias=True)])
         rl_env.goal_embedding = compute_average_goal_embedding(tcc, proc, dataset_path, isaac_env.device)
     except Exception as e:
         raise RuntimeError("Failed to compute goal embedding. Aborting training.") from e
 
     rl_env = VecMonitor(rl_env)
+    norm_obs = not bool(args_cli.disable_obs_normalization)
+    if args_cli.pretrained_checkpoint is not None and norm_obs:
+        print(
+            "[PPO] Warning: VecNormalize(norm_obs=True) is active with a BC checkpoint. "
+            "pretrain_ppo.py trains on raw observations; use --disable_obs_normalization "
+            "for the raw-BC freeze ablation.",
+            flush=True,
+        )
+    print(f"[PPO] VecNormalize: norm_obs={norm_obs}, norm_reward=True", flush=True)
     rl_env = VecNormalize(
         rl_env,
-        norm_obs=True,
+        norm_obs=norm_obs,
         norm_reward=True,
         clip_obs=np.inf,
         clip_reward=np.inf,
         training=True,
     )
 
-    tmp_path = "/home/aiprah/Documents/m_dVrk/sb3_log_sim/"
+    log_suffix = args_cli.log_suffix.strip()
+    log_suffix = f"_{log_suffix}" if log_suffix else ""
+    tmp_path = f"/home/aiprah/Documents/m_dVrk/random_sb3_log_sim_{args_cli.task_phase}{log_suffix}/"
     episode_csv_path = os.path.join(tmp_path, EPISODE_CSV_FILENAME)
     vec_normalize_path = os.path.join(tmp_path, "vecnormalize.pkl")
     new_logger = configure(tmp_path, ["stdout","csv", "tensorboard"])
     checkpoint_callback = CheckpointCallback(
         6000,
         "/home/aiprah/Documents/m_dVrk/modelli_salvati_sim",
-        "dvrk_ppo",
+        f"dvrk_ppo_{args_cli.task_phase}{log_suffix}",
         save_vecnormalize=True,
     )
     
@@ -1045,19 +1354,33 @@ def main_train():
         f"transitions_per_update={effective_batch_size} | batch_size={batch_size} | "
         f"n_epochs={PPO_N_EPOCHS}"
     , flush=True)
+    print(
+        f"[PPO] learning_rate={args_cli.learning_rate:g} | ent_coef={args_cli.ent_coef:g}",
+        flush=True,
+    )
     
     episode_csv_callback = EpisodeCsvLoggerCallback(episode_csv_path)
     best_terminal_distance_callback = BestTerminalDistanceCheckpointCallback(
         save_dir="/home/aiprah/Documents/m_dVrk/modelli_salvati_sim",
-        file_prefix=BEST_TERMINAL_DISTANCE_PREFIX,
+        file_prefix=f"{BEST_TERMINAL_DISTANCE_PREFIX}_{args_cli.task_phase}{log_suffix}",
         window_size=BEST_TERMINAL_DISTANCE_WINDOW_EPISODES,
         verbose=1,
     )
-    callback = CallbackList([
+    callbacks_list = [
         checkpoint_callback,
         episode_csv_callback,
         best_terminal_distance_callback,
-    ])
+    ]
+
+    freeze_timesteps = args_cli.freeze_policy_timesteps
+    if freeze_timesteps > 0:
+        if args_cli.pretrained_checkpoint is not None:
+            print(f"[PPO] Pre-trained checkpoint loaded. Policy will be frozen for the first {freeze_timesteps} timesteps.", flush=True)
+            callbacks_list.append(FreezePolicyCallback(freeze_timesteps=freeze_timesteps))
+        else:
+            print(f"[PPO] Warning: Policy freezing requested ({freeze_timesteps} timesteps), but no pre-trained checkpoint was provided. Disabling freeze.", flush=True)
+
+    callback = CallbackList(callbacks_list)
 
     policy_kwargs = dict(
     net_arch=dict(
@@ -1067,29 +1390,57 @@ def main_train():
     activation_fn=nn.ReLU,
     )
 
-    model = PPO(
-        "MlpPolicy",
-        rl_env,
-        verbose=1,
-        device="cuda",
-        seed=42,
-        learning_rate=PPO_LEARNING_RATE,
-        n_steps=n_steps,
-        batch_size=batch_size,
-        n_epochs=PPO_N_EPOCHS,
-        gamma=0.99,
-        gae_lambda=0.95,
-        ent_coef=PPO_ENT_COEF,
-        vf_coef=0.5,
-        max_grad_norm=0.5,
-        stats_window_size=1,
-        tensorboard_log="/home/aiprah/Documents/m_dVrk/tensorboard_logs_sim",
-        policy_kwargs=policy_kwargs,
-    )
+    if args_cli.pretrained_checkpoint is not None:
+        print(f"[PPO] Loading pre-trained policy from {args_cli.pretrained_checkpoint}...", flush=True)
+        custom_objects = {
+            "learning_rate": args_cli.learning_rate,
+            "n_steps": n_steps,
+            "batch_size": batch_size,
+            "n_epochs": PPO_N_EPOCHS,
+            "ent_coef": args_cli.ent_coef,
+        }
+        model = PPO.load(
+            args_cli.pretrained_checkpoint,
+            env=rl_env,
+            custom_objects=custom_objects,
+            device="cuda",
+            tensorboard_log="/home/aiprah/Documents/m_dVrk/tensorboard_logs_sim",
+        )
+    else:
+        print("[PPO] Initializing model with random weights...", flush=True)
+        model = PPO(
+            "MlpPolicy",
+            rl_env,
+            verbose=1,
+            device="cuda",
+            seed=42,
+            learning_rate=args_cli.learning_rate,
+            n_steps=n_steps,
+            batch_size=batch_size,
+            n_epochs=PPO_N_EPOCHS,
+            gamma=0.99,
+            gae_lambda=0.95,
+            ent_coef=args_cli.ent_coef,
+            vf_coef=0.5,
+            max_grad_norm=0.5,
+            stats_window_size=1,
+            tensorboard_log="/home/aiprah/Documents/m_dVrk/tensorboard_logs_sim",
+            policy_kwargs=policy_kwargs,
+        )
 
     model.set_logger(new_logger)
+    
+    # === DEBUG: Print policy structure ===
+    print("\n[DEBUG] === PPO Policy Parameter Structure ===", flush=True)
+    total_params = 0
+    for name, param in model.policy.named_parameters():
+        total_params += param.numel()
+        print(f"  {name:60s} | shape: {param.shape} | numel: {param.numel():10d}", flush=True)
+    print(f"[DEBUG] Total parameters in policy: {total_params}", flush=True)
+    print()
+    
     print("[PPO] Model initialized. Starting learn()...", flush=True)
-    model.learn(total_timesteps=5_000_000, log_interval=1, callback=callback)
+    model.learn(total_timesteps=args_cli.total_timesteps, log_interval=1, callback=callback)
     print("[PPO] learn() completed. Saving final model...", flush=True)
     model.save("/home/aiprah/Documents/m_dVrk/modelli_salvati_sim/dvrk_ppo_finale")
 
