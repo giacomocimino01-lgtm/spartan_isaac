@@ -22,6 +22,8 @@ from isaaclab.sensors import CameraCfg
 
 from . import mdp
 
+from m_dVrk.hrl.constants import RING_NAMES, ALL_PEG_NAMES
+
 MODULE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 USD_DATA_DIR = os.path.join(MODULE_DIR, "data", "usd")
 
@@ -385,17 +387,8 @@ class EventCfg:
         func=mdp.reset_rings_on_board,
         mode="reset",
         params={
-            "ring_names": ["ring_red", "ring_yellow", "ring_green", "ring_blue"],
-            "peg_names": [
-                "peg_red",
-                "peg_yellow",
-                "peg_green",
-                "peg_blue",
-                "peg_gray",
-                "peg_gray1",
-                "peg_gray2",
-                "peg_gray3",
-            ],
+            "ring_names": RING_NAMES,
+            "peg_names": ALL_PEG_NAMES,
             "x_range": (0.318, 0.432),
             "y_range": (-0.107, 0.007),
             "z_height": 0.717,

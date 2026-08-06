@@ -367,6 +367,7 @@ from pathlib import Path
 
 from app_launcher_utils import pin_process_to_requested_cuda_device
 from isaaclab.app import AppLauncher
+from m_dVrk.hrl.constants import PEG_GREEN
 
 parser = argparse.ArgumentParser(description="Collect scripted dVRK peg-and-ring videos for TCC.")
 parser.add_argument("--num_envs", type=int, default=8, help="Number of parallel Isaac environments.")
@@ -403,7 +404,7 @@ parser.add_argument(
     default="random",
     help="Arm selection for each ring.",
 )
-parser.add_argument("--target_peg", type=str, default="peg_green", help="Peg where rings are placed.")
+parser.add_argument("--target_peg", type=str, default=PEG_GREEN, help="Peg where rings are placed.")
 parser.add_argument(
     "--num_rings",
     type=int,
@@ -439,6 +440,7 @@ import torchvision.io as io
 from isaaclab.envs import ManagerBasedRLEnv
 from m_dVrk.tasks.manager_based.m_dvrk.m_dvrk_env_cfg import MDvrkEnvCfg
 from parallel_env import RING_NAMES, SPARTANStateMachine, sync_attached_and_frozen_rings
+from m_dVrk.hrl.constants import PEG_GREEN, PEG_RED, PEG_BLUE
 
 ScriptedStateMachine = SPARTANStateMachine
 
@@ -477,8 +479,8 @@ def choose_arm(mode: str, ring_idx: int) -> str:
 
 def build_commands_for_env(sm, env_id: int, class_name: str, ring_order: str, arm_mode: str, target_peg: str, num_rings: int = 4) -> tuple[list[tuple[str, str, str]], list[str]]:
     if class_name == "phase_1":
-        rings = sm.get_top_rings_on_peg(env_id, "peg_green", num_rings=4)
-        dest_pegs = ["peg_red", "peg_red", "peg_blue", "peg_blue"]
+        rings = sm.get_top_rings_on_peg(env_id, PEG_GREEN, num_rings=4)
+        dest_pegs = [PEG_RED, PEG_RED, PEG_BLUE, PEG_BLUE]
         random.shuffle(dest_pegs)
         
         commands: list[tuple[str, str, str]] = []

@@ -598,82 +598,6 @@
 #                 "left_arm",
 #             )
 
-#         desired_pos_r_w = tip_r + act_r[:, 0:3]
-#         desired_pos_l_w = tip_l + act_l[:, 0:3]
-
-#         desired_pos_r_b, _ = math_utils.subtract_frame_transforms(
-#             robot_r.data.root_pos_w,
-#             robot_r.data.root_quat_w,
-#             desired_pos_r_w,
-#             None,
-#         )
-#         desired_pos_l_b, _ = math_utils.subtract_frame_transforms(
-#             robot_l.data.root_pos_w,
-#             robot_l.data.root_quat_w,
-#             desired_pos_l_w,
-#             None,
-#         )
-
-#         act_r[:, 0:3] = desired_pos_r_b
-#         act_r[:, 3:7] = self.target_quat_r
-#         act_l[:, 0:3] = desired_pos_l_b
-#         act_l[:, 3:7] = self.target_quat_l
-
-#         return torch.cat([act_r, grip_r, act_l, grip_l], dim=-1)
-
-#     def green_peg_ring_count(self, env_id: int) -> int:
-#         return self._count_rings_on_peg(env_id, "peg_green")
-
-#     def successful(self, env_id: int, target_peg: str) -> bool:
-#         return all(
-#             self.frozen_rings_mask[ring_name][env_id]
-#             and self.ring_support_peg[ring_name][env_id] == target_peg
-#             for ring_name in RING_NAMES
-#         )
-
-
-# def sync_attached_and_frozen_rings(env, sm: SPARTANStateMachine, active_env_mask: torch.Tensor):
-#     robot_r = env.scene["robot_right"]
-#     robot_l = env.scene["robot_left"]
-#     tip_r = robot_r.data.body_pos_w[:, sm._tip_idx_r]
-#     tip_l = robot_l.data.body_pos_w[:, sm._tip_idx_l]
-#     snap_offset_r = torch.tensor([-0.005, 0.0, 0.0], device=env.device)
-#     snap_offset_l = torch.tensor([+0.005, 0.0, 0.0], device=env.device)
-#     snap_quat = torch.tensor([1.0, 0.0, 0.0, 0.0], device=env.device)
-
-#     for ring_name in RING_NAMES:
-#         ring = env.scene[ring_name]
-#         new_s = ring.data.root_state_w.clone()
-#         mask_r = torch.tensor(
-#             [sm.attached_target_r[i] == ring_name for i in range(env.num_envs)],
-#             dtype=torch.bool,
-#             device=env.device,
-#         ) & active_env_mask
-#         mask_l = torch.tensor(
-#             [sm.attached_target_l[i] == ring_name for i in range(env.num_envs)],
-#             dtype=torch.bool,
-#             device=env.device,
-#         ) & active_env_mask
-#         mask_frozen = sm.frozen_rings_mask[ring_name] & active_env_mask
-#         write_mask = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
-
-#         if mask_r.any():
-#             new_s[mask_r, 0:3] = tip_r[mask_r] + snap_offset_r
-#             new_s[mask_r, 3:7] = snap_quat
-#             new_s[mask_r, 7:13] = 0.0
-#             write_mask |= mask_r
-#         if mask_l.any():
-#             new_s[mask_l, 0:3] = tip_l[mask_l] + snap_offset_l
-#             new_s[mask_l, 3:7] = snap_quat
-#             new_s[mask_l, 7:13] = 0.0
-#             write_mask |= mask_l
-#         if mask_frozen.any():
-#             new_s[mask_frozen, 0:7] = sm.frozen_rings_pose[ring_name][mask_frozen]
-#             new_s[mask_frozen, 7:13] = 0.0
-#             write_mask |= mask_frozen
-#         if write_mask.any():
-#             env_ids_to_write = write_mask.nonzero(as_tuple=False).flatten()
-#             ring.write_root_state_to_sim(new_s[env_ids_to_write], env_ids=env_ids_to_write)
 
 
 """Shared dVRK parallel environment control primitives.
@@ -689,10 +613,10 @@ import random
 import torch
 
 import isaaclab.utils.math as math_utils
+from m_dVrk.hrl.constants import RING_NAMES, ALL_PEG_NAMES, PEG_GREEN, PEG_RED, PEG_BLUE
 
-
-RING_NAMES = ["ring_red", "ring_yellow", "ring_green", "ring_blue"]
-PEG_NAMES = ["peg_red", "peg_yellow", "peg_green", "peg_gray", "peg_gray1", "peg_blue"]
+# Local alias for backwards compatibility in this module
+PEG_NAMES = ALL_PEG_NAMES
 ARM_IDLE_STATE = "IDLE"
 INITIAL_PHASE_BY_VERB = {
     "reach": "MOVE_TO_REACH_ENTRY",
@@ -870,8 +794,8 @@ class SPARTANStateMachine:
 
     def _tip_reached(self, tip_pos, dest) -> bool:
         return (
-            torch.norm(dest[0:2] - tip_pos[0:2]) < self.TOLERANCE_XY
-            and torch.abs(dest[2] - tip_pos[2]) < self.TOLERANCE_Z
+            torch.norm(dest[0:2] - tip_pos[0:2]).item() < self.TOLERANCE_XY
+            and torch.abs(dest[2] - tip_pos[2]).item() < self.TOLERANCE_Z
         )
 
     def _get_fixed_speed_cmd(self, current_pos, dest):
@@ -1036,9 +960,9 @@ class SPARTANStateMachine:
             # Stack all 4 rings on peg_green in a randomized order
             rings_to_stack = RING_NAMES.copy()
             random.shuffle(rings_to_stack)
-            peg_pos_w = self._get_cached_peg_position_w("peg_green", env_id)
+            peg_pos_w = self._get_cached_peg_position_w(PEG_GREEN, env_id)
             if peg_pos_w is None:
-                peg_pos_w = _get_scene_entity_position_w(self.env, "peg_green", env_id)
+                peg_pos_w = _get_scene_entity_position_w(self.env, PEG_GREEN, env_id)
             
             for idx, ring_name in enumerate(rings_to_stack):
                 release_pos = peg_pos_w.clone()
@@ -1046,10 +970,10 @@ class SPARTANStateMachine:
                 self.frozen_rings_mask[ring_name][env_id] = True
                 self.frozen_rings_pose[ring_name][env_id, 0:3] = release_pos
                 self.frozen_rings_pose[ring_name][env_id, 3:7] = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device)
-                self.ring_support_peg[ring_name][env_id] = "peg_green"
+                self.ring_support_peg[ring_name][env_id] = PEG_GREEN
                 self.ring_stack_level[ring_name][env_id] = idx
                 
-            self._sync_peg_inventory(env_id, "peg_green")
+            self._sync_peg_inventory(env_id, PEG_GREEN)
 
         print(f"[ENV {env_id}] Reset completo ({phase}). Stato macchina a stati reimpostato.")
 
@@ -1349,12 +1273,12 @@ class SPARTANStateMachine:
         return torch.cat([act_r, grip_r, act_l, grip_l], dim=-1)
 
     def green_peg_ring_count(self, env_id: int) -> int:
-        return self._count_rings_on_peg(env_id, "peg_green")
+        return self._count_rings_on_peg(env_id, PEG_GREEN)
 
-    def successful(self, env_id: int, phase: str = "phase_0", target_peg: str = "peg_green") -> bool:
+    def successful(self, env_id: int, phase: str = "phase_0", target_peg: str = PEG_GREEN) -> bool:
         if phase == "phase_1":
-            red_count = self._count_rings_on_peg(env_id, "peg_red")
-            blue_count = self._count_rings_on_peg(env_id, "peg_blue")
+            red_count = self._count_rings_on_peg(env_id, PEG_RED)
+            blue_count = self._count_rings_on_peg(env_id, PEG_BLUE)
             all_frozen = all(self.frozen_rings_mask[ring_name][env_id] for ring_name in RING_NAMES)
             return all_frozen and red_count == 2 and blue_count == 2
         else:
@@ -1368,8 +1292,8 @@ class SPARTANStateMachine:
 def sync_attached_and_frozen_rings(env, sm: SPARTANStateMachine, active_env_mask: torch.Tensor):
     robot_r = env.scene["robot_right"]
     robot_l = env.scene["robot_left"]
-    tip_r = robot_r.data.body_pos_w[:, sm._tip_idx_r]
-    tip_l = robot_l.data.body_pos_w[:, sm._tip_idx_l]
+    tip_r = robot_r.data.body_pos_w[:, sm.get_tip_idx_r()]
+    tip_l = robot_l.data.body_pos_w[:, sm.get_tip_idx_l()]
     snap_offset_r = torch.tensor([-0.005, 0.0, 0.0], device=env.device)
     snap_offset_l = torch.tensor([+0.005, 0.0, 0.0], device=env.device)
     snap_quat = torch.tensor([1.0, 0.0, 0.0, 0.0], device=env.device)

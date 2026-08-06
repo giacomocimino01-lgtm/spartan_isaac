@@ -2,8 +2,29 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import os
 
-# Load progress data
-csv_path = '/home/aiprah/Documents/m_dVrk/sb3_log_sim/progress.csv'
+
+def _load_project_paths():
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    cfg_path = os.path.join(repo_root, "configs", "defaults.yaml")
+    try:
+        import yaml
+
+        if os.path.exists(cfg_path):
+            with open(cfg_path, "r") as f:
+                cfg = yaml.safe_load(f) or {}
+            return cfg.get("paths", {})
+    except Exception:
+        pass
+    return {}
+
+
+_paths = _load_project_paths()
+ARTIFACTS_DIR = _paths.get("artifacts_dir", "artifacts/")
+
+# Load progress data (prefer artifacts location)
+csv_path = os.path.join(ARTIFACTS_DIR, "logs", "sb3", "progress.csv")
+if not os.path.exists(csv_path):
+    csv_path = "/home/aiprah/Documents/m_dVrk/sb3_log_sim/progress.csv"
 df = pd.read_csv(csv_path)
 
 # Create a figure with subplots
@@ -54,12 +75,15 @@ axs[2, 1].grid(True)
 
 plt.tight_layout()
 plt.subplots_adjust(top=0.95)
-out_path = '/home/aiprah/Documents/m_dVrk/sim_training_metrics.png'
+out_path = os.path.join(ARTIFACTS_DIR, "reports", "sim_training_metrics.png")
+os.makedirs(os.path.dirname(out_path), exist_ok=True)
 plt.savefig(out_path)
 print(f'Saved metrics plot to {out_path}')
 
 # Now extract distances from log file
-log_path = '/home/aiprah/Documents/m_dVrk/outlog.log'
+log_path = os.path.join(ARTIFACTS_DIR, "logs", "outlog.log")
+if not os.path.exists(log_path):
+    log_path = '/home/aiprah/Documents/m_dVrk/outlog.log'
 distances = []
 with open(log_path, 'r') as f:
     for line in f:
@@ -79,6 +103,7 @@ if distances:
     plt.xlabel('Logged Episode Index (ENV 0)')
     plt.ylabel('Distance')
     plt.grid(True)
-    dist_out_path = '/home/aiprah/Documents/m_dVrk/sim_distance_metrics.png'
+    dist_out_path = os.path.join(ARTIFACTS_DIR, "reports", "sim_distance_metrics.png")
+    os.makedirs(os.path.dirname(dist_out_path), exist_ok=True)
     plt.savefig(dist_out_path)
     print(f'Saved distance plot to {dist_out_path}')
