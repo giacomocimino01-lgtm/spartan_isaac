@@ -1,0 +1,18 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "m_dVrk NPZ dataset metadata",
+  "type": "object",
+  "required": ["obs_dim", "aux_dim", "geom_dim", "emb_dim", "task_phase", "timestamp"],
+  "properties": {
+    "obs_dim": {"type": "integer", "minimum": 1},
+    "aux_dim": {"type": "integer", "minimum": 0},
+    "geom_dim": {"type": "integer", "minimum": 0},
+    "emb_dim": {"type": ["integer", "null"]},
+    "task_phase": {"type": "string"},
+    "num_rings": {"type": "integer", "minimum": 0},
+    "seed": {"type": ["integer", "null"]},
+    "git_commit": {"type": ["string", "null"]},
+    "timestamp": {"type": "string", "format": "date-time"}
+  },
+  "additionalProperties": true
+}

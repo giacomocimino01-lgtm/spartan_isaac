@@ -5,10 +5,37 @@ Comprehensive training analysis and report
 import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
+import os
 from datetime import datetime
 
-# Read CSV
-csv_file = 'random_sb3_log_sim_phase_1_bc_raw_no_norm_300k/progress.csv'
+
+def _load_project_paths():
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        cfg_path = os.path.join(repo_root, "configs", "defaults.yaml")
+        try:
+                import yaml
+                if os.path.exists(cfg_path):
+                        with open(cfg_path, "r") as f:
+                                cfg = yaml.safe_load(f) or {}
+                        return cfg.get("paths", {})
+        except Exception:
+                pass
+        return {}
+
+
+_paths = _load_project_paths()
+ARTIFACTS_DIR = _paths.get("artifacts_dir", "artifacts/")
+
+# Read CSV: prefer artifacts location for the specific run, fallback to local path
+csv_file = os.path.join(
+        ARTIFACTS_DIR,
+        "logs",
+        "random_sb3_log_sim_phase_1_bc_raw_no_norm_lr3e-5_ent0.001_freeze500k_5m",
+        "progress.csv",
+)
+if not os.path.exists(csv_file):
+        csv_file = 'random_sb3_log_sim_phase_1_bc_raw_no_norm_lr3e-5_ent0.001_freeze500k_5m/progress.csv'
+
 df = pd.read_csv(csv_file)
 
 # Clean up - remove rows where ep_rew_mean is NaN
@@ -101,8 +128,15 @@ ax5.text(0.01, 0.99, stats_text, transform=ax5.transAxes, fontsize=10,
 plt.suptitle(f'Training Analysis Report - Generated {datetime.now().strftime("%Y-%m-%d %H:%M")}',
             fontsize=15, fontweight='bold', y=0.995)
 
-plt.savefig('random_sb3_log_sim_phase_1/training_analysis_report.png', dpi=150, bbox_inches='tight')
-print("✓ Comprehensive report saved to: random_sb3_log_sim_phase_1/training_analysis_report.png")
+out_report = os.path.join(
+        ARTIFACTS_DIR,
+        "reports",
+        "random_sb3_log_sim_phase_1_bc_raw_no_norm_lr3e-5_ent0.001_freeze500k_5m",
+        "training_analysis_report.png",
+)
+os.makedirs(os.path.dirname(out_report), exist_ok=True)
+plt.savefig(out_report, dpi=150, bbox_inches='tight')
+print(f"✓ Comprehensive report saved to: {out_report}")
 
 # Print key findings
 print("\n" + "="*60)

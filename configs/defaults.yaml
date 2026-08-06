@@ -1,0 +1,22 @@
+# Default configuration for m_dVrk experiments
+# Override via CLI or environment-specific YAML files.
+
+seed: 42
+num_envs: 8
+task_phase: "phase_0"
+num_rings: 4
+
+ppo:
+  learning_rate: 3e-4
+  ent_coef: 0.015
+  batch_size: 2048
+  n_epochs: 5
+
+tcc:
+  embedding_size: 32
+  checkpoint: null
+
+paths:
+  artifacts_dir: artifacts/
+  success_dump_dir: success_snapshots/
+  success_video_dir: success_videos/

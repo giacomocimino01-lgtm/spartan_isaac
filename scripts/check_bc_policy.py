@@ -32,26 +32,22 @@ except ImportError as exc:
         "scripts/check_bc_policy.py ...`."
     ) from exc
 
+    from m_dVrk.hrl.constants import (
+        VERB_MAP,
+        TARGET_MAP,
+        VERB_TO_ID,
+        TARGET_TO_ID,
+        RING_NAMES,
+        PEG_NAMES,
+        OBS_DIM,
+    )
 
-VERB_MAP = {0: "reach", 1: "grasp", 2: "release", 3: "idle"}
-TARGET_MAP = {
-    0: "ring_red",
-    1: "ring_yellow",
-    2: "ring_green",
-    3: "ring_blue",
-    4: "peg_red",
-    5: "peg_yellow",
-    6: "peg_green",
-    7: "peg_blue",
-    8: "peg_gray",
-    9: "None",
-}
 
-ACTION_HEADS = ("verb_l", "target_l", "verb_r", "target_r")
-IDLE_VERB = 3
-NONE_TARGET = 9
-RING_TARGET_IDS = {0, 1, 2, 3}
-PEG_TARGET_IDS = {4, 5, 6, 7, 8}
+    ACTION_HEADS = ("verb_l", "target_l", "verb_r", "target_r")
+    IDLE_VERB = VERB_TO_ID["idle"]
+    NONE_TARGET = TARGET_TO_ID["None"]
+    RING_TARGET_IDS = {TARGET_TO_ID[name] for name in RING_NAMES}
+    PEG_TARGET_IDS = {TARGET_TO_ID[name] for name in PEG_NAMES}
 
 
 class SpaceOnlyVecEnv(VecEnv):
@@ -92,14 +88,17 @@ class SpaceOnlyVecEnv(VecEnv):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Check behavior cloning policy quality offline.")
+    # Prefer artifacts locations by default
+    default_ckpt = os.path.join("modelli_salvati_sim", "randomized_dvrk_ppo_pretrained_phase1.zip")
+    default_dataset = "dataset_supervisionato_randomized_phase1.npz"
     parser.add_argument(
         "--checkpoint",
-        default="modelli_salvati_sim/randomized_dvrk_ppo_pretrained_phase1.zip",
+        default=default_ckpt,
         help="Path to the SB3 PPO checkpoint to evaluate.",
     )
     parser.add_argument(
         "--dataset_path",
-        default="dataset_supervisionato_randomized_phase1.npz",
+        default=default_dataset,
         help="Path to the NPZ dataset containing `obs` and `actions` arrays.",
     )
     parser.add_argument(
@@ -238,6 +237,13 @@ def main() -> None:
         labels = labels[: args.limit]
 
     describe_dataset(obs, labels)
+
+    # Check observation contract
+    if obs.shape[1] != OBS_DIM:
+        raise SystemExit(
+            f"Dataset obs dim ({obs.shape[1]}) != canonical OBS_DIM ({OBS_DIM}). "
+            "Use the canonical wrapper to collect dataset or update hrl/constants if intended."
+        )
 
     device = args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu"
     print(f"[model] loading checkpoint={args.checkpoint} device={device}")
