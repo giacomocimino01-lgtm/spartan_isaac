@@ -123,14 +123,97 @@ from m_dVrk.hrl.constants import (
     VERB_MAP, TARGET_MAP, VERB_TO_ID, TARGET_TO_ID,
     RING_TARGETS, PEG_TARGETS, RING_NAMES, PEG_NAMES, IDLE_ACTION,
 )
-parser.add_argument("--target_peg", type=str, default=PEG_GREEN, help="Peg where rings are placed.")
 from m_dVrk.hrl.tcc import XIRLResnet18, load_tcc_model
 from m_dVrk.hrl.wrapper import DVRKVisionHRLWrapper
 from m_dVrk.controllers.spartan_state_machine import SPARTANStateMachine
 from m_dVrk.controllers.ring_sync import get_scene_entity_positions_w, sync_attached_and_frozen_rings
 
-# 4. MAIN DATA COLLECTION LOOP
+
+# ─── Helper classes & functions ───────────────────────────────────────────────
+
+class EpisodeSlot:
+    """Per-environment state used by the collection loop."""
+    def __init__(self):
+        self.obs_buffer: list = []
+        self.actions_buffer: list = []
+        self.rgb_buffer: list = []
+        self.step_idx: int = 0
+        self.done: bool = False
+        # High-level command queue: list of (verb, arm, target) triples
+        self.commands: list = []
+        self.command_idx: int = 0
+
+
+def _build_commands(ring_order: str, arm_mode: str, target_peg: str, num_rings: int) -> list:
+    """Build the ordered list of (verb, arm, target) triples for one episode."""
+    import random as _rnd
+    rings = list(RING_NAMES)[:num_rings]
+    if ring_order == "random":
+        _rnd.shuffle(rings)
+    commands = []
+    for i, ring in enumerate(rings):
+        if arm_mode == "right":
+            arm = "right_arm"
+        elif arm_mode == "left":
+            arm = "left_arm"
+        elif arm_mode == "alternate":
+            arm = "right_arm" if i % 2 == 0 else "left_arm"
+        else:
+            arm = _rnd.choice(["right_arm", "left_arm"])
+        commands += [
+            ("reach",   arm, ring),
+            ("grasp",   arm, ring),
+            ("reach",   arm, target_peg),
+            ("release", arm, target_peg),
+        ]
+    return commands
+
+
+def start_episode(isaac_env, sm, slots, env_id: int):
+    """Reset an environment slot and arm the command queue for a new episode."""
+    slot = slots[env_id]
+    slot.obs_buffer = []
+    slot.actions_buffer = []
+    slot.rgb_buffer = []
+    slot.step_idx = 0
+    slot.done = False
+    slot.commands = _build_commands(
+        args_cli.ring_order,
+        args_cli.arm_mode,
+        args_cli.target_peg,
+        args_cli.num_rings,
+    )
+    slot.command_idx = 0
+    sm.reset_env(env_id, phase=args_cli.task_phase)
+
+
+_IDLE_VERB_ID   = VERB_TO_ID["idle"]
+_NONE_TARGET_ID = TARGET_TO_ID["None"]
+
+
+def get_triplet_action_for_env(sm, slot: EpisodeSlot, env_id: int):
+    """Return (verb_l, tgt_l, verb_r, tgt_r) for this env's current command."""
+    # Issue the next command when the state machine is free
+    if sm.all_idle(env_id) and slot.command_idx < len(slot.commands):
+        verb_str, arm_str, tgt_str = slot.commands[slot.command_idx]
+        slot.command_idx += 1
+        sm.set_new_triplet(verb_str, arm_str, tgt_str, env_id)
+
+    cmd_l = sm.current_triplet_l[env_id]
+    cmd_r = sm.current_triplet_r[env_id]
+
+    verb_l = VERB_TO_ID.get(cmd_l["verb"], _IDLE_VERB_ID)   if cmd_l else _IDLE_VERB_ID
+    tgt_l  = TARGET_TO_ID.get(cmd_l["target"], _NONE_TARGET_ID) if cmd_l else _NONE_TARGET_ID
+    verb_r = VERB_TO_ID.get(cmd_r["verb"], _IDLE_VERB_ID)   if cmd_r else _IDLE_VERB_ID
+    tgt_r  = TARGET_TO_ID.get(cmd_r["target"], _NONE_TARGET_ID) if cmd_r else _NONE_TARGET_ID
+
+    return verb_l, tgt_l, verb_r, tgt_r
+
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+
 def main():
+
     if args_cli.task_phase == "phase_1":
         args_cli.num_rings = 4
     random.seed(args_cli.seed)
@@ -172,8 +255,21 @@ def main():
     tcc.eval()
 
     rl_env = DVRKVisionHRLWrapper(isaac_env, sm, tcc, task_phase=args_cli.task_phase)
-    
-    # Initialize Episode slots
+
+    # Compute goal embedding from the dataset so the reward function is not None
+    import torchvision.transforms as T
+    goal_dataset_path = f"/mnt/data/aiprah/data/random_sim_dataset_tcc/train/{args_cli.task_phase}/"
+    proc = T.Compose([T.Resize((112, 112), antialias=True)])
+    try:
+        rl_env.compute_and_set_goal_embedding(tcc, proc, goal_dataset_path, raise_on_error=True)
+        print(f"[collector] Goal embedding set from {goal_dataset_path}")
+    except Exception as e:
+        print(f"[collector] WARNING: Could not set goal embedding from {goal_dataset_path}: {e}")
+        print("[collector] Using zero goal embedding as fallback.")
+        import torch as _torch
+        rl_env.goal_embedding = _torch.zeros(rl_env.emb_dim, device=isaac_env.device)
+
+
     slots = [EpisodeSlot() for _ in range(args_cli.num_envs)]
     
     successful_episodes_count = 0

@@ -189,9 +189,9 @@ def reset_rings_on_board(
 ):
     """Reset all rings jointly on the board while avoiding pegs and mutual overlaps.
 
-    Ring x/y positions are expressed in the local frame of each environment. If
-    ``randomize`` is false, explicit ``fixed_ring_poses`` are used when provided;
-    otherwise a deterministic clearance-aware grid layout is used.
+    Ring x/y positions are expressed in the local frame of each environment.
+    Phase 0 requires randomized placements on the board; fixed poses are only
+    intended for debugging or specialized non-random initial conditions.
     """
 
     device = env.device

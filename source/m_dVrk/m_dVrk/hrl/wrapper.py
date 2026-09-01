@@ -295,6 +295,7 @@ class DVRKVisionHRLWrapper(VecEnv):
     def _sanitize_arm_command(
         self,
         env_id: int,
+        subject: str,
         verb: str,
         target: str,
     ) -> tuple[str, str, bool]:
@@ -303,8 +304,25 @@ class DVRKVisionHRLWrapper(VecEnv):
             return "idle", "None", False
         if target == "None":
             return "idle", "None", True
+
+        last_target = (
+            self.sm.last_target_r[env_id]
+            if subject == "right_arm"
+            else self.sm.last_target_l[env_id]
+        )
+        attached_target = (
+            self.sm.attached_target_r[env_id]
+            if subject == "right_arm"
+            else self.sm.attached_target_l[env_id]
+        )
+
+        if verb == "reach":
+            return verb, target, False
+
         if verb == "grasp":
             if target not in RING_TARGETS:
+                return "idle", "None", True
+            if last_target != target:
                 return "idle", "None", True
             current_peg = self.sm.ring_support_peg.get(target, [None] * self.num_envs)[env_id]
             if current_peg is not None and current_peg != "None":
@@ -312,8 +330,17 @@ class DVRKVisionHRLWrapper(VecEnv):
                 top_ring = top_rings[0] if top_rings else None
                 if top_ring != target:
                     return "idle", "None", True
-        if verb == "release":
             return verb, target, False
+
+        if verb == "release":
+            if target not in {t for t in TARGET_MAP.values() if t.startswith("peg_")}:
+                return "idle", "None", True
+            if attached_target is None:
+                return "idle", "None", True
+            if last_target != target:
+                return "idle", "None", True
+            return verb, target, False
+
         return verb, target, False
 
     # -----------------------------------------------------------------------
@@ -373,8 +400,8 @@ class DVRKVisionHRLWrapper(VecEnv):
             verb_r = VERB_MAP[int(actions[i, 2])]
             tgt_r  = TARGET_MAP[int(actions[i, 3])]
 
-            verb_l, tgt_l, invalid_l = self._sanitize_arm_command(i, verb_l, tgt_l)
-            verb_r, tgt_r, invalid_r = self._sanitize_arm_command(i, verb_r, tgt_r)
+            verb_l, tgt_l, invalid_l = self._sanitize_arm_command(i, "left_arm", verb_l, tgt_l)
+            verb_r, tgt_r, invalid_r = self._sanitize_arm_command(i, "right_arm", verb_r, tgt_r)
 
             sanitized_actions[i, 0] = VERB_TO_ID[verb_l]
             sanitized_actions[i, 1] = TARGET_TO_ID[tgt_l]

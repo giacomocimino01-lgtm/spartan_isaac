@@ -32,22 +32,21 @@ except ImportError as exc:
         "scripts/check_bc_policy.py ...`."
     ) from exc
 
-    from m_dVrk.hrl.constants import (
-        VERB_MAP,
-        TARGET_MAP,
-        VERB_TO_ID,
-        TARGET_TO_ID,
-        RING_NAMES,
-        PEG_NAMES,
-        OBS_DIM,
-    )
+from m_dVrk.hrl.constants import (
+    VERB_MAP,
+    TARGET_MAP,
+    VERB_TO_ID,
+    TARGET_TO_ID,
+    RING_NAMES,
+    PEG_NAMES,
+    OBS_DIM,
+)
 
-
-    ACTION_HEADS = ("verb_l", "target_l", "verb_r", "target_r")
-    IDLE_VERB = VERB_TO_ID["idle"]
-    NONE_TARGET = TARGET_TO_ID["None"]
-    RING_TARGET_IDS = {TARGET_TO_ID[name] for name in RING_NAMES}
-    PEG_TARGET_IDS = {TARGET_TO_ID[name] for name in PEG_NAMES}
+ACTION_HEADS = ("verb_l", "target_l", "verb_r", "target_r")
+IDLE_VERB = VERB_TO_ID["idle"]
+NONE_TARGET = TARGET_TO_ID["None"]
+RING_TARGET_IDS = {TARGET_TO_ID[name] for name in RING_NAMES}
+PEG_TARGET_IDS = {TARGET_TO_ID[name] for name in PEG_NAMES}
 
 
 class SpaceOnlyVecEnv(VecEnv):

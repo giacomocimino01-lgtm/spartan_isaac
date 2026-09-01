@@ -1,0 +1,326 @@
+[3gH    H    H    H    H    H    H    H    H    H    H    H    H    H    H    H    H    H    H    H   [INFO] Using python from: /home/aiprah/miniconda3/envs/env_isaaclab/bin/python
+Gym has been unmaintained since 2022 and does not support NumPy 2.0 amongst other critical functionality.
+Please upgrade to Gymnasium, the maintained drop-in replacement of Gym, or contact the authors of your software and request that they upgrade.
+See the migration guide at https://gymnasium.farama.org/introduction/migration_guide/ for additional information.
+[INFO][AppLauncher]: Using device: cuda:0
+[INFO][AppLauncher]: Loading experience file: /home/aiprah/Documents/IsaacLab/apps/isaaclab.python.headless.rendering.kit
+Loading user config located at: '/home/aiprah/miniconda3/envs/env_isaaclab/lib/python3.11/site-packages/isaacsim/kit/data/Kit/Isaac-Sim/5.1/user.config.json'
+[Info] [carb] Logging to file: /home/aiprah/miniconda3/envs/env_isaaclab/lib/python3.11/site-packages/isaacsim/kit/logs/Kit/Isaac-Sim/5.1/kit_20260901_161414.log
+2026-09-01T14:14:14Z [103ms] [Warning] [carb.windowing-glfw.plugin] GLFW initialization failed.
+2026-09-01T14:14:14Z [103ms] [Warning] [carb] Failed to startup plugin carb.windowing-glfw.plugin (interfaces: [carb::windowing::IGLContext v1.0],[carb::windowing::IWindowing v1.5]) (impl: carb.windowing-glfw.plugin)
+2026-09-01T14:14:14Z [148ms] [Warning] [omni.platforminfo.plugin] failed to open the default display.  Can't verify X Server version.
+2026-09-01T14:14:14Z [161ms] [Warning] [carb.cudainterop.plugin] CUDA_VISIBLE_DEVICES environment variable is set.
+2026-09-01T14:14:14Z [161ms] [Warning] [carb.cudainterop.plugin] Note CUDA device enumeration and Omniverse device enumeration are different.
+2026-09-01T14:14:14Z [161ms] [Warning] [carb.cudainterop.plugin] Setting CUDA_VISIBLE_DEVICES can lead to undesired behavior or crashes.
+2026-09-01T14:14:14Z [443ms] [Warning] [carb.windowing-glfw.plugin] GLFW initialization failed.
+2026-09-01T14:14:14Z [443ms] [Warning] [carb] Failed to startup plugin carb.windowing-glfw.plugin (interfaces: [carb::windowing::IGLContext v1.0],[carb::windowing::IWindowing v1.5]) (impl: carb.windowing-glfw.plugin)
+2026-09-01T14:14:15Z [577ms] [Warning] [gpu.foundation.plugin] Skipping NVIDIA GPU due CUDA being in bad state: NVIDIA GeForce RTX 4090
+2026-09-01T14:14:15Z [577ms] [Warning] [gpu.foundation.plugin] Please restart your system if CUDA is known to work in your system.
+2026-09-01T14:14:15Z [577ms] [Warning] [gpu.foundation.plugin] Skipping NVIDIA GPU due CUDA being in bad state: NVIDIA GeForce RTX 4090
+2026-09-01T14:14:15Z [577ms] [Warning] [gpu.foundation.plugin] Please restart your system if CUDA is known to work in your system.
+
+|---------------------------------------------------------------------------------------------|
+| Driver Version: 580.65.06     | Graphics API: Vulkan
+|=============================================================================================|
+| GPU | Name                             | Active | LDA | GPU Memory | Vendor-ID | LUID       |
+|     |                                  |        |     |            | Device-ID | UUID       |
+|     |                                  |        |     |            | Bus-ID    |            |
+|---------------------------------------------------------------------------------------------|
+| 0   | NVIDIA GeForce RTX 5090          | Yes: 0 |     | 32607   MB | 10de      | 0          |
+|     |                                  |        |     |            | 2b85      | 715c44fa.. |
+|     |                                  |        |     |            | 1         |            |
+|---------------------------------------------------------------------------------------------|
+| 1   | NVIDIA GeForce RTX 4090          |        |     | 24564   MB | 10de      | 0          |
+|     |                                  |        |     |            | 2684      | 07fdd5b9.. |
+|     |                                  |        |     |            | 3         |            |
+|=============================================================================================|
+| OS: 24.04.1 LTS (Noble Numbat) ubuntu, Version: 24.04.1, Kernel: 6.14.0-29-generic
+| Processor: AMD Ryzen 9 7950X3D 16-Core Processor
+| Cores: 16 | Logical Cores: 32
+|---------------------------------------------------------------------------------------------|
+| Total Memory (MB): 95688 | Free Memory: 79375
+| Total Page/Swap (MB): 90111 | Free Page/Swap: 86490
+|---------------------------------------------------------------------------------------------|
+2026-09-01T14:14:15Z [842ms] [Warning] [gpu.foundation.plugin] PCIe link width current (8) and maximum (16) for device 0 don't match.
+2026-09-01T14:14:15Z [842ms] [Warning] [gpu.foundation.plugin] IOMMU is enabled.
+2026-09-01T14:14:15Z [842ms] [Warning] [gpu.foundation.plugin] Detected IOMMU is enabled. Running CUDA peer-to-peer bandwidth and latency validation.
+Unidirectional P2P=Enabled Bandwidth (P2P Writes) Matrix (GB/s)
+   D\D     0 
+     0 1528.86 
+P2P=Enabled Latency (P2P Writes) Matrix (us)
+   GPU     0 
+     0   2.14 
+
+   CPU     0 
+     0   1.58 
+2026-09-01T14:14:15Z [1,347ms] [Warning] [carb.windowing-glfw.plugin] GLFW initialization failed.
+2026-09-01T14:14:15Z [1,347ms] [Warning] [carb] Failed to startup plugin carb.windowing-glfw.plugin (interfaces: [carb::windowing::IGLContext v1.0],[carb::windowing::IWindowing v1.5]) (impl: carb.windowing-glfw.plugin)
+2026-09-01T14:14:15Z [1,372ms] [Warning] [carb.windowing-glfw.plugin] GLFW initialization failed.
+2026-09-01T14:14:15Z [1,372ms] [Warning] [carb] Failed to startup plugin carb.windowing-glfw.plugin (interfaces: [carb::windowing::IGLContext v1.0],[carb::windowing::IWindowing v1.5]) (impl: carb.windowing-glfw.plugin)
+2026-09-01T14:14:15Z [1,378ms] [Warning] [carb.windowing-glfw.plugin] GLFW initialization failed.
+2026-09-01T14:14:15Z [1,378ms] [Warning] [carb] Failed to startup plugin carb.windowing-glfw.plugin (interfaces: [carb::windowing::IGLContext v1.0],[carb::windowing::IWindowing v1.5]) (impl: carb.windowing-glfw.plugin)
+2026-09-01T14:14:15Z [1,386ms] [Warning] [carb.windowing-glfw.plugin] GLFW initialization failed.
+2026-09-01T14:14:15Z [1,386ms] [Warning] [carb] Failed to startup plugin carb.windowing-glfw.plugin (interfaces: [carb::windowing::IGLContext v1.0],[carb::windowing::IWindowing v1.5]) (impl: carb.windowing-glfw.plugin)
+2026-09-01T14:14:15Z [1,387ms] [Warning] [carb.windowing-glfw.plugin] GLFW initialization failed.
+2026-09-01T14:14:15Z [1,387ms] [Warning] [carb] Failed to startup plugin carb.windowing-glfw.plugin (interfaces: [carb::windowing::IGLContext v1.0],[carb::windowing::IWindowing v1.5]) (impl: carb.windowing-glfw.plugin)
+2026-09-01T14:14:15Z [1,388ms] [Warning] [carb.windowing-glfw.plugin] GLFW initialization failed.
+2026-09-01T14:14:15Z [1,388ms] [Warning] [carb] Failed to startup plugin carb.windowing-glfw.plugin (interfaces: [carb::windowing::IGLContext v1.0],[carb::windowing::IWindowing v1.5]) (impl: carb.windowing-glfw.plugin)
+2026-09-01T14:14:16Z [1,539ms] [Warning] [omni.log] Source: omni.hydra was already registered.
+2026-09-01T14:14:16Z [1,745ms] [Warning] [carb] Acquiring non optional plugin interface which is not listed as dependency: [omni::physx::IPhysxBenchmarks v1.0] (plugin: <default plugin>), by client: omni.physics.physx.plugin. Add it to CARB_PLUGIN_IMPL_DEPS() macro of a client.
+2026-09-01T14:14:16Z [1,752ms] [Warning] [omni.isaac.dynamic_control] omni.isaac.dynamic_control is deprecated as of Isaac Sim 4.5. No action is needed from end-users.
+2026-09-01T14:14:16Z [2,165ms] [Warning] [pxr.Semantics] pxr.Semantics is deprecated - please use Semantics instead
+2026-09-01T14:14:16Z [2,234ms] [Warning] [omni.graph.core.plugin] Found duplicate of category 'Replicator' - was 'Annotators', adding 'Fabric Reader'
+2026-09-01T14:14:16Z [2,234ms] [Warning] [omni.graph.core.plugin] Category 'Replicator' not accepted on node type 'omni.replicator.core.FabricReader' in extension 'omni.replicator.core'
+2026-09-01T14:14:16Z [2,235ms] [Warning] [omni.replicator.core.scripts.extension] No material configuration file, adding configuration to material settings directly.
+2026-09-01T14:14:17Z [2,578ms] [Error] [carb.scripting-python.plugin] KeyboardInterrupt: <EMPTY MESSAGE>
+
+At:
+  <frozen importlib._bootstrap_external>(1130): get_data
+  <frozen importlib._bootstrap_external>(1033): get_code
+  <frozen importlib._bootstrap_external>(936): exec_module
+  <frozen importlib._bootstrap>(705): _load_unlocked
+  <frozen importlib._bootstrap>(1150): _find_and_load_unlocked
+  <frozen importlib._bootstrap>(1176): _find_and_load
+  <frozen importlib._bootstrap>(241): _call_with_frames_removed
+  <frozen importlib._bootstrap>(1233): _handle_fromlist
+  /home/aiprah/miniconda3/envs/env_isaaclab/lib/python3.11/site-packages/trimesh/path/path.py(23): <module>
+  <frozen importlib._bootstrap>(241): _call_with_frames_removed
+  <frozen importlib._bootstrap_external>(940): exec_module
+  <frozen importlib._bootstrap>(705): _load_unlocked
+  <frozen importlib._bootstrap>(1150): _find_and_load_unlocked
+  <frozen importlib._bootstrap>(1176): _find_and_load
+  /home/aiprah/miniconda3/envs/env_isaaclab/lib/python3.11/site-packages/trimesh/path/__init__.py(18): <module>
+  <frozen importlib._bootstrap>(241): _call_with_frames_removed
+  <frozen importlib._bootstrap_external>(940): exec_module
+  <frozen importlib._bootstrap>(707): _load_unlocked
+  <frozen importlib._bootstrap>(1159): _find_and_load_unlocked
+  <frozen importlib._bootstrap>(1173): _find_and_load
+  <frozen importlib._bootstrap>(241): _call_with_frames_removed
+  <frozen importlib._bootstrap>(1159): _find_and_load_unlocked
+  <frozen importlib._bootstrap>(1173): _find_and_load
+  <frozen importlib._bootstrap>(241): _call_with_frames_removed
+  <frozen importlib._bootstrap>(1159): _find_and_load_unlocked
+  <frozen importlib._bootstrap>(1173): _find_and_load
+  /home/aiprah/miniconda3/envs/env_isaaclab/lib/python3.11/site-packages/trimesh/repair.py(354): <module>
+  <frozen importlib._bootstrap>(241): _call_with_frames_removed
+  <frozen importlib._bootstrap_external>(940): exec_module
+  <frozen importlib._bootstrap>(707): _load_unlocked
+  <frozen importlib._bootstrap>(1159): _find_and_load_unlocked
+  <frozen importlib._bootstrap>(1173): _find_and_load
+  <frozen importlib._bootstrap>(241): _call_with_frames_removed
+  <frozen importlib._bootstrap>(1241): _handle_fromlist
+  /home/aiprah/miniconda3/envs/env_isaaclab/lib/python3.11/site-packages/trimesh/base.py(83): <module>
+  <frozen importlib._bootstrap>(241): _call_with_frames_removed
+  <frozen importlib._bootstrap_external>(940): exec_module
+  <frozen importlib._bootstrap>(705): _load_unlocked
+  <frozen importlib._bootstrap>(1150): _find_and_load_unlocked
+  <frozen importlib._bootstrap>(1176): _find_and_load
+  /home/aiprah/miniconda3/envs/env_isaaclab/lib/python3.11/site-packages/trimesh/creation.py(15): <module>
+  <frozen importlib._bootstrap>(241): _call_with_frames_removed
+  <frozen importlib._bootstrap_external>(940): exec_module
+  <frozen importlib._bootstrap>(705): _load_unlocked
+  <frozen importlib._bootstrap>(1150): _find_and_load_unlocked
+  <frozen importlib._bootstrap>(1176): _find_and_load
+  <frozen importlib._bootstrap>(241): _call_with_frames_removed
+  <frozen importlib._bootstrap>(1233): _handle_fromlist
+  /home/aiprah/miniconda3/envs/env_isaaclab/lib/python3.11/site-packages/trimesh/__init__.py(12): <module>
+  <frozen importlib._bootstrap>(241): _call_with_frames_removed
+  <frozen importlib._bootstrap_external>(940): exec_module
+  <frozen importlib._bootstrap>(705): _load_unlocked
+  <frozen importlib._bootstrap>(1149): _find_and_load_unlocked
+  <frozen importlib._bootstrap>(1176): _find_and_load
+  /home/aiprah/Documents/IsaacLab/source/isaaclab/isaaclab/utils/mesh.py(12): <module>
+  <frozen importlib._bootstrap>(241): _call_with_frames_removed
+  <frozen importlib._bootstrap_external>(940): exec_module
+  <frozen importlib._bootstrap>(705): _load_unlocked
+  <frozen importlib._bootstrap>(1150): _find_and_load_unlocked
+  <frozen importlib._bootstrap>(1176): _find_and_load
+  /home/aiprah/Documents/IsaacLab/source/isaaclab/isaaclab/utils/__init__.py(14): <module>
+  <frozen importlib._bootstrap>(241): _call_with_frames_removed
+  <frozen importlib._bootstrap_external>(940): exec_module
+  <frozen importlib._bootstrap>(705): _load_unlocked
+  <frozen importlib._bootstrap>(1150): _find_and_load_unlocked
+  <frozen importlib._bootstrap>(1176): _find_and_load
+  /home/aiprah/Documents/IsaacLab/source/isaaclab/isaaclab/sim/converters/asset_converter_base_cfg.py(8): <module>
+  <frozen importlib._bootstrap>(241): _call_with_frames_removed
+  <frozen importlib._bootstrap_external>(940): exec_module
+  <frozen importlib._bootstrap>(705): _load_unlocked
+  <frozen importlib._bootstrap>(1150): _find_and_load_unlocked
+  <frozen importlib._bootstrap>(1176): _find_and_load
+  /home/aiprah/Documents/IsaacLab/source/isaaclab/isaaclab/sim/converters/asset_converter_base.py(14): <module>
+  <frozen importlib._bootstrap>(241): _call_with_frames_removed
+  <frozen importlib._bootstrap_external>(940): exec_module
+  <frozen importlib._bootstrap>(705): _load_unlocked
+  <frozen importlib._bootstrap>(1150): _find_and_load_unlocked
+  <frozen importlib._bootstrap>(1176): _find_and_load
+  /home/aiprah/Documents/IsaacLab/source/isaaclab/isaaclab/sim/converters/__init__.py(19): <module>
+  <frozen importlib._bootstrap>(241): _call_with_frames_removed
+  <frozen importlib._bootstrap_external>(940): exec_module
+  <frozen importlib._bootstrap>(705): _load_unlocked
+  <frozen importlib._bootstrap>(1150): _find_and_load_unlocked
+  <frozen importlib._bootstrap>(1176): _find_and_load
+  /home/aiprah/Documents/IsaacLab/source/isaaclab/isaaclab/sim/__init__.py(29): <module>
+  <frozen importlib._bootstrap>(241): _call_with_frames_removed
+  <frozen importlib._bootstrap_external>(940): exec_module
+  <frozen importlib._bootstrap>(705): _load_unlocked
+  <frozen importlib._bootstrap>(1150): _find_and_load_unlocked
+  <frozen importlib._bootstrap>(1176): _find_and_load
+  /home/aiprah/Documents/IsaacLab/source/isaaclab_assets/isaaclab_assets/robots/agibot.py(15): <module>
+  <frozen importlib._bootstrap>(241): _call_with_frames_removed
+  <frozen importlib._bootstrap_external>(940): exec_module
+  <frozen importlib._bootstrap>(705): _load_unlocked
+  <frozen importlib._bootstrap>(1150): _find_and_load_unlocked
+  <frozen importlib._bootstrap>(1176): _find_and_load
+  /home/aiprah/Documents/IsaacLab/source/isaaclab_assets/isaaclab_assets/robots/__init__.py(10): <module>
+  <frozen importlib._bootstrap>(241): _call_with_frames_removed
+  <frozen importlib._bootstrap_external>(940): exec_module
+  <frozen importlib._bootstrap>(705): _load_unlocked
+  <frozen importlib._bootstrap>(1150): _find_and_load_unlocked
+  <frozen importlib._bootstrap>(1176): _find_and_load
+  /home/aiprah/Documents/IsaacLab/source/isaaclab_assets/isaaclab_assets/__init__.py(23): <module>
+  <frozen importlib._bootstrap>(241): _call_with_frames_removed
+  <frozen importlib._bootstrap_external>(940): exec_module
+  <frozen importlib._bootstrap>(705): _load_unlocked
+  <frozen importlib._bootstrap>(1149): _find_and_load_unlocked
+  <frozen importlib._bootstrap>(1176): _find_and_load
+  <frozen importlib._bootstrap>(1204): _gcd_import
+  /home/aiprah/miniconda3/envs/env_isaaclab/lib/python3.11/importlib/__init__.py(126): import_module
+  /home/aiprah/miniconda3/envs/env_isaaclab/lib/python3.11/site-packages/isaacsim/kit/kernel/py/omni/ext/_impl/custom_importer.py(86): import_module
+  /home/aiprah/miniconda3/envs/env_isaaclab/lib/python3.11/site-packages/isaacsim/kit/kernel/py/omni/ext/_impl/_internal.py(103): _import_public
+  /home/aiprah/miniconda3/envs/env_isaaclab/lib/python3.11/site-packages/isaacsim/kit/kernel/py/omni/ext/_impl/_internal.py(199): _custom_importer
+  /home/aiprah/miniconda3/envs/env_isaaclab/lib/python3.11/site-packages/isaacsim/kit/kernel/py/omni/ext/_impl/_internal.py(220): startup
+  /home/aiprah/miniconda3/envs/env_isaaclab/lib/python3.11/site-packages/isaacsim/kit/kernel/py/omni/ext/_impl/_internal.py(337): startup_extension
+  PythonExtension.cpp::startup()(2): <module>
+  /home/aiprah/miniconda3/envs/env_isaaclab/lib/python3.11/site-packages/isaacsim/exts/isaacsim.simulation_app/isaacsim/simulation_app/simulation_app.py(534): _start_app
+  /home/aiprah/miniconda3/envs/env_isaaclab/lib/python3.11/site-packages/isaacsim/exts/isaacsim.simulation_app/isaacsim/simulation_app/simulation_app.py(270): __init__
+  /home/aiprah/Documents/IsaacLab/source/isaaclab/isaaclab/app/app_launcher.py(823): _create_app
+  /home/aiprah/Documents/IsaacLab/source/isaaclab/isaaclab/app/app_launcher.py(131): __init__
+  /home/aiprah/Documents/m_dVrk/scripts/eval_run.py(101): <module>
+
+2026-09-01T14:14:17Z [2,579ms] [Error] [omni.ext.plugin] [ext: isaaclab_assets-0.2.4] Failed to startup python extension.
+2026-09-01T14:14:17Z [2,822ms] [Error] [carb.scripting-python.plugin] KeyboardInterrupt: <EMPTY MESSAGE>
+
+At:
+  <frozen importlib._bootstrap_external>(1130): get_data
+  <frozen importlib._bootstrap_external>(1033): get_code
+  <frozen importlib._bootstrap_external>(936): exec_module
+  <frozen importlib._bootstrap>(705): _load_unlocked
+  <frozen importlib._bootstrap>(1150): _find_and_load_unlocked
+  <frozen importlib._bootstrap>(1176): _find_and_load
+  <frozen importlib._bootstrap>(241): _call_with_frames_removed
+  <frozen importlib._bootstrap>(1233): _handle_fromlist
+  /home/aiprah/miniconda3/envs/env_isaaclab/lib/python3.11/site-packages/trimesh/path/path.py(23): <module>
+  <frozen importlib._bootstrap>(241): _call_with_frames_removed
+  <frozen importlib._bootstrap_external>(940): exec_module
+  <frozen importlib._bootstrap>(705): _load_unlocked
+  <frozen importlib._bootstrap>(1150): _find_and_load_unlocked
+  <frozen importlib._bootstrap>(1176): _find_and_load
+  /home/aiprah/miniconda3/envs/env_isaaclab/lib/python3.11/site-packages/trimesh/path/__init__.py(18): <module>
+  <frozen importlib._bootstrap>(241): _call_with_frames_removed
+  <frozen importlib._bootstrap_external>(940): exec_module
+  <frozen importlib._bootstrap>(707): _load_unlocked
+  <frozen importlib._bootstrap>(1159): _find_and_load_unlocked
+  <frozen importlib._bootstrap>(1173): _find_and_load
+  <frozen importlib._bootstrap>(241): _call_with_frames_removed
+  <frozen importlib._bootstrap>(1159): _find_and_load_unlocked
+  <frozen importlib._bootstrap>(1173): _find_and_load
+  <frozen importlib._bootstrap>(241): _call_with_frames_removed
+  <frozen importlib._bootstrap>(1159): _find_and_load_unlocked
+  <frozen importlib._bootstrap>(1173): _find_and_load
+  /home/aiprah/miniconda3/envs/env_isaaclab/lib/python3.11/site-packages/trimesh/repair.py(354): <module>
+  <frozen importlib._bootstrap>(241): _call_with_frames_removed
+  <frozen importlib._bootstrap_external>(940): exec_module
+  <frozen importlib._bootstrap>(707): _load_unlocked
+  <frozen importlib._bootstrap>(1159): _find_and_load_unlocked
+  <frozen importlib._bootstrap>(1173): _find_and_load
+  <frozen importlib._bootstrap>(241): _call_with_frames_removed
+  <frozen importlib._bootstrap>(1241): _handle_fromlist
+  /home/aiprah/miniconda3/envs/env_isaaclab/lib/python3.11/site-packages/trimesh/base.py(83): <module>
+  <frozen importlib._bootstrap>(241): _call_with_frames_removed
+  <frozen importlib._bootstrap_external>(940): exec_module
+  <frozen importlib._bootstrap>(705): _load_unlocked
+  <frozen importlib._bootstrap>(1150): _find_and_load_unlocked
+  <frozen importlib._bootstrap>(1176): _find_and_load
+  /home/aiprah/miniconda3/envs/env_isaaclab/lib/python3.11/site-packages/trimesh/creation.py(15): <module>
+  <frozen importlib._bootstrap>(241): _call_with_frames_removed
+  <frozen importlib._bootstrap_external>(940): exec_module
+  <frozen importlib._bootstrap>(705): _load_unlocked
+  <frozen importlib._bootstrap>(1150): _find_and_load_unlocked
+  <frozen importlib._bootstrap>(1176): _find_and_load
+  <frozen importlib._bootstrap>(241): _call_with_frames_removed
+  <frozen importlib._bootstrap>(1233): _handle_fromlist
+  /home/aiprah/miniconda3/envs/env_isaaclab/lib/python3.11/site-packages/trimesh/__init__.py(12): <module>
+  <frozen importlib._bootstrap>(241): _call_with_frames_removed
+  <frozen importlib._bootstrap_external>(940): exec_module
+  <frozen importlib._bootstrap>(705): _load_unlocked
+  <frozen importlib._bootstrap>(1149): _find_and_load_unlocked
+  <frozen importlib._bootstrap>(1176): _find_and_load
+  /home/aiprah/Documents/IsaacLab/source/isaaclab/isaaclab/utils/mesh.py(12): <module>
+  <frozen importlib._bootstrap>(241): _call_with_frames_removed
+  <frozen importlib._bootstrap_external>(940): exec_module
+  <frozen importlib._bootstrap>(705): _load_unlocked
+  <frozen importlib._bootstrap>(1150): _find_and_load_unlocked
+  <frozen importlib._bootstrap>(1176): _find_and_load
+  /home/aiprah/Documents/IsaacLab/source/isaaclab/isaaclab/utils/__init__.py(14): <module>
+  <frozen importlib._bootstrap>(241): _call_with_frames_removed
+  <frozen importlib._bootstrap_external>(940): exec_module
+  <frozen importlib._bootstrap>(705): _load_unlocked
+  <frozen importlib._bootstrap>(1150): _find_and_load_unlocked
+  <frozen importlib._bootstrap>(1176): _find_and_load
+  /home/aiprah/Documents/IsaacLab/source/isaaclab/isaaclab/sim/converters/asset_converter_base_cfg.py(8): <module>
+  <frozen importlib._bootstrap>(241): _call_with_frames_removed
+  <frozen importlib._bootstrap_external>(940): exec_module
+  <frozen importlib._bootstrap>(705): _load_unlocked
+  <frozen importlib._bootstrap>(1150): _find_and_load_unlocked
+  <frozen importlib._bootstrap>(1176): _find_and_load
+  /home/aiprah/Documents/IsaacLab/source/isaaclab/isaaclab/sim/converters/asset_converter_base.py(14): <module>
+  <frozen importlib._bootstrap>(241): _call_with_frames_removed
+  <frozen importlib._bootstrap_external>(940): exec_module
+  <frozen importlib._bootstrap>(705): _load_unlocked
+  <frozen importlib._bootstrap>(1150): _find_and_load_unlocked
+  <frozen importlib._bootstrap>(1176): _find_and_load
+  /home/aiprah/Documents/IsaacLab/source/isaaclab/isaaclab/sim/converters/__init__.py(19): <module>
+  <frozen importlib._bootstrap>(241): _call_with_frames_removed
+  <frozen importlib._bootstrap_external>(940): exec_module
+  <frozen importlib._bootstrap>(705): _load_unlocked
+  <frozen importlib._bootstrap>(1150): _find_and_load_unlocked
+  <frozen importlib._bootstrap>(1176): _find_and_load
+  /home/aiprah/Documents/IsaacLab/source/isaaclab/isaaclab/sim/__init__.py(29): <module>
+  <frozen importlib._bootstrap>(241): _call_with_frames_removed
+  <frozen importlib._bootstrap_external>(940): exec_module
+  <frozen importlib._bootstrap>(705): _load_unlocked
+  <frozen importlib._bootstrap>(1150): _find_and_load_unlocked
+  <frozen importlib._bootstrap>(1176): _find_and_load
+  /home/aiprah/Documents/IsaacLab/source/isaaclab_assets/isaaclab_assets/robots/agibot.py(15): <module>
+  <frozen importlib._bootstrap>(241): _call_with_frames_removed
+  <frozen importlib._bootstrap_external>(940): exec_module
+  <frozen importlib._bootstrap>(705): _load_unlocked
+  <frozen importlib._bootstrap>(1150): _find_and_load_unlocked
+  <frozen importlib._bootstrap>(1176): _find_and_load
+  /home/aiprah/Documents/IsaacLab/source/isaaclab_assets/isaaclab_assets/robots/__init__.py(10): <module>
+  <frozen importlib._bootstrap>(241): _call_with_frames_removed
+  <frozen importlib._bootstrap_external>(940): exec_module
+  <frozen importlib._bootstrap>(705): _load_unlocked
+  <frozen importlib._bootstrap>(1150): _find_and_load_unlocked
+  <frozen importlib._bootstrap>(1176): _find_and_load
+  /home/aiprah/Documents/IsaacLab/source/isaaclab_assets/isaaclab_assets/__init__.py(23): <module>
+  <frozen importlib._bootstrap>(241): _call_with_frames_removed
+  <frozen importlib._bootstrap_external>(940): exec_module
+  <frozen importlib._bootstrap>(705): _load_unlocked
+  <frozen importlib._bootstrap>(1149): _find_and_load_unlocked
+  <frozen importlib._bootstrap>(1176): _find_and_load
+  <frozen importlib._bootstrap>(1204): _gcd_import
+  /home/aiprah/miniconda3/envs/env_isaaclab/lib/python3.11/importlib/__init__.py(126): import_module
+  /home/aiprah/miniconda3/envs/env_isaaclab/lib/python3.11/site-packages/isaacsim/kit/kernel/py/omni/ext/_impl/custom_importer.py(86): import_module
+  /home/aiprah/miniconda3/envs/env_isaaclab/lib/python3.11/site-packages/isaacsim/kit/kernel/py/omni/ext/_impl/_internal.py(103): _import_public
+  /home/aiprah/miniconda3/envs/env_isaaclab/lib/python3.11/site-packages/isaacsim/kit/kernel/py/omni/ext/_impl/_internal.py(199): _custom_importer
+  /home/aiprah/miniconda3/envs/env_isaaclab/lib/python3.11/site-packages/isaacsim/kit/kernel/py/omni/ext/_impl/_internal.py(220): startup
+  /home/aiprah/miniconda3/envs/env_isaaclab/lib/python3.11/site-packages/isaacsim/kit/kernel/py/omni/ext/_impl/_internal.py(337): startup_extension
+  PythonExtension.cpp::startup()(2): <module>
+  /home/aiprah/miniconda3/envs/env_isaaclab/lib/python3.11/site-packages/isaacsim/exts/isaacsim.simulation_app/isaacsim/simulation_app/simulation_app.py(534): _start_app
+  /home/aiprah/miniconda3/envs/env_isaaclab/lib/python3.11/site-packages/isaacsim/exts/isaacsim.simulation_app/isaacsim/simulation_app/simulation_app.py(270): __init__
+  /home/aiprah/Documents/IsaacLab/source/isaaclab/isaaclab/app/app_launcher.py(823): _create_app
+  /home/aiprah/Documents/IsaacLab/source/isaaclab/isaaclab/app/app_launcher.py(131): __init__
+  /home/aiprah/Documents/m_dVrk/scripts/eval_run.py(101): <module>
+
+2026-09-01T14:14:17Z [2,822ms] [Error] [omni.ext.plugin] [ext: isaaclab_tasks-0.11.14] Failed to startup python extension.

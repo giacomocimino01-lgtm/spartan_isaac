@@ -78,11 +78,21 @@ def _load_project_paths():
 _paths = _load_project_paths()
 ARTIFACTS_DIR = _paths.get("artifacts_dir", "artifacts/")
 
-# Prefer artifacts checkpoint if default path missing
+# Smart checkpoint resolution: if given path is missing, search for the filename in artifacts/repo
 if not os.path.exists(args_cli.checkpoint):
-    alt_ckpt = os.path.join(ARTIFACTS_DIR, "checkpoints", "ppo", os.path.basename(args_cli.checkpoint))
-    if os.path.exists(alt_ckpt):
-        args_cli.checkpoint = alt_ckpt
+    target_name = os.path.basename(args_cli.checkpoint)
+    found_path = None
+    for root_dir in [ARTIFACTS_DIR, ".", ".."]:
+        if os.path.exists(root_dir):
+            for r, _, files in os.walk(root_dir):
+                if target_name in files:
+                    found_path = os.path.abspath(os.path.join(r, target_name))
+                    break
+            if found_path:
+                break
+    if found_path:
+        print(f"[INFO] Resolved checkpoint path to: {found_path}")
+        args_cli.checkpoint = found_path
 
 # The camera sensor requires Isaac rendering to be enabled.
 if not getattr(args_cli, "enable_cameras", False):
@@ -168,7 +178,6 @@ def main_eval():
         sm,
         tcc,
         task_phase=args_cli.task_phase,
-        phase1_initial_state=args_cli.phase1_initial_state,
     )
     
     # Compute goal embedding on the raw unwrapped environment first
@@ -220,22 +229,13 @@ def main_eval():
     print("[INFO] Starting evaluation...")
     obs = rl_env.reset()
     
+    episode_count = 0
     steps = 0
     while simulation_app.is_running():
         # The RL agent computes actions deterministically
         action, _states = model.predict(obs, deterministic=not args_cli.stochastic_actions)
         # Executes the step in the environment
         obs, rewards, dones, infos = rl_env.step(action)
-        if dones[0]:
-            info0 = infos[0]
-            print(
-                f"[DONE] success={info0.get('is_success', False)} "
-                f"rings_complete={info0.get('rings_complete', False)} "
-                f"red={info0.get('red_peg_ring_count', 0)} "
-                f"blue={info0.get('blue_peg_ring_count', 0)} "
-                f"green={info0.get('green_peg_ring_count', 0)} "
-                f"distance={info0.get('terminal_distance', float('nan')):.4f}"
-            )
         
         # Get active triplets for env 0
         cmd_l = rl_env.sm.current_triplet_l[0]
@@ -267,14 +267,33 @@ def main_eval():
         # Convert back to PyTorch CPU tensor and append
         frame = torch.from_numpy(frame_np)
         video_frames.append(frame)
-
-        if steps >= 390 and video_frames:
-            video_tensor = torch.stack(video_frames) # (T, H, W, C)
-            io.write_video("pov_operazione.mp4", video_tensor, fps=30)
-            print("Video saved: pov_operazione.mp4")
+        
+        # Save video when episode terminates (at reset)
+        if dones[0]:
+            info0 = infos[0]
+            print(
+                f"[DONE] success={info0.get('is_success', False)} "
+                f"rings_complete={info0.get('rings_complete', False)} "
+                f"red={info0.get('red_peg_ring_count', 0)} "
+                f"blue={info0.get('blue_peg_ring_count', 0)} "
+                f"green={info0.get('green_peg_ring_count', 0)} "
+                f"distance={info0.get('terminal_distance', float('nan')):.4f}"
+            )
+            
+            # Save video
+            if video_frames:
+                phase_num = args_cli.task_phase.replace("phase_", "")
+                success_str = "success" if info0.get('is_success', False) else "fail"
+                video_name = f"episode_{episode_count:03d}_{success_str}_phase_{phase_num}.mp4"
+                video_tensor = torch.stack(video_frames)  # (T, H, W, C)
+                io.write_video(video_name, video_tensor, fps=30)
+                print(f"\033[92m✓ Video saved: {video_name} ({len(video_frames)} frames, {steps} steps)\033[0m")
+                video_frames = []
+            
+            episode_count += 1
             steps = 0
-            video_frames = []
-        steps += 1
+        else:
+            steps += 1
 
 if __name__ == "__main__":
     main_eval()

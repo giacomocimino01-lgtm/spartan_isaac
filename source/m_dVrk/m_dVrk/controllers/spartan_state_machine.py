@@ -24,7 +24,6 @@ from m_dVrk.controllers.ring_sync import (
     get_scene_entity_position_w,
     _get_scene_entity_position_w,
 )
-from m_dVrk.hrl.constants import RING_NAMES, ALL_PEG_NAMES
 from m_dVrk.hrl.constants import RING_NAMES, ALL_PEG_NAMES, PEG_GREEN, PEG_RED, PEG_BLUE
 
 
@@ -389,6 +388,33 @@ class SPARTANStateMachine:
         If the verb is ``"idle"``, the arm is immediately transitioned to IDLE.
         """
         new_cmd = {"verb": verb, "subject": subject, "target": target}
+
+        if verb == "grasp":
+            if target not in RING_NAMES:
+                return
+            last_target = (
+                self.last_target_r[env_id]
+                if subject == "right_arm"
+                else self.last_target_l[env_id]
+            )
+            if last_target != target:
+                return
+
+        if verb == "release":
+            if target == "None" or not target.startswith("peg_"):
+                return
+            attached_target = (
+                self.attached_target_r[env_id]
+                if subject == "right_arm"
+                else self.attached_target_l[env_id]
+            )
+            last_target = (
+                self.last_target_r[env_id]
+                if subject == "right_arm"
+                else self.last_target_l[env_id]
+            )
+            if attached_target is None or last_target != target:
+                return
 
         if subject == "right_arm":
             if (
