@@ -7,6 +7,7 @@ observations, wrapper, callbacks, TCC model) lives in:
 """
 import argparse
 import os
+import sys
 import math
 import random
 import numpy as np
@@ -79,10 +80,57 @@ parser.add_argument(
     help="PPO learning rate. Lower values are useful when fine-tuning a BC-pretrained actor.",
 )
 parser.add_argument(
+    "--lr_schedule",
+    choices=["constant", "low_high_cosine"],
+    default="low_high_cosine",
+    help="Learning-rate schedule. low_high_cosine uses a low critic LR during actor freeze, then rises and decays.",
+)
+parser.add_argument(
+    "--freeze_learning_rate",
+    type=float,
+    default=None,
+    help="LR during actor freeze. Defaults to one third of --learning_rate.",
+)
+parser.add_argument(
+    "--final_learning_rate",
+    type=float,
+    default=None,
+    help="Final LR after cosine decay. Defaults to one tenth of --learning_rate.",
+)
+parser.add_argument(
+    "--lr_ramp_timesteps",
+    type=int,
+    default=250_000,
+    help="Linear LR ramp duration after actor unfreezing.",
+)
+parser.add_argument(
+    "--lr_decay_start_fraction",
+    type=float,
+    default=0.70,
+    help="Fraction of total training at which cosine LR decay starts.",
+)
+parser.add_argument(
     "--ent_coef",
     type=float,
     default=0.015,
     help="PPO entropy coefficient. Lower values reduce exploration pressure after BC pretraining.",
+)
+parser.add_argument(
+    "--final_ent_coef",
+    type=float,
+    default=0.0,
+    help="Final entropy coefficient after cosine annealing.",
+)
+parser.add_argument(
+    "--ent_decay_start_fraction",
+    type=float,
+    default=0.70,
+    help="Fraction of total training at which entropy annealing starts.",
+)
+parser.add_argument(
+    "--action_masking",
+    action="store_true",
+    help="Enable state-aware joint masking while keeping MultiDiscrete([4,10,4,10]). Requires raw observations.",
 )
 parser.add_argument(
     "--log_suffix",
@@ -131,7 +179,13 @@ from m_dVrk.hrl.callbacks import (
     EpisodeCsvLoggerCallback,
     BestTerminalDistanceCheckpointCallback,
     FreezePolicyCallback,
+    EntropyCoefficientScheduleCallback,
 )
+from m_dVrk.hrl.masked_policy import (
+    MaskedMultiDiscreteActorCriticPolicy,
+    masked_policy_custom_objects,
+)
+from m_dVrk.hrl.schedules import CosineDecaySchedule, LowHighCosineSchedule
 from m_dVrk.controllers.spartan_state_machine import SPARTANStateMachine
 
 # (All constants are now imported from m_dVrk.hrl.constants above)
@@ -199,6 +253,15 @@ def derive_ppo_batch_size(effective_batch_size: int, preferred_batch_size: int) 
 # TRAINING MAIN
 # ==========================================
 def main_train():
+    if not 0.0 <= args_cli.lr_decay_start_fraction <= 1.0:
+        raise ValueError("--lr_decay_start_fraction must be in [0, 1]")
+    if not 0.0 <= args_cli.ent_decay_start_fraction <= 1.0:
+        raise ValueError("--ent_decay_start_fraction must be in [0, 1]")
+    if args_cli.action_masking and not args_cli.disable_obs_normalization:
+        raise ValueError(
+            "--action_masking currently requires --disable_obs_normalization because "
+            "the mask reads the categorical state fields from the raw 244-D observation."
+        )
     env_cfg = MDvrkEnvCfg()
     env_cfg.scene.num_envs = args_cli.num_envs
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
@@ -312,15 +375,61 @@ def main_train():
     n_steps = derive_ppo_n_steps(args_cli.num_envs, PPO_TARGET_TRANSITIONS_PER_UPDATE)
     effective_batch_size = n_steps * args_cli.num_envs
     batch_size = derive_ppo_batch_size(effective_batch_size, PPO_PREFERRED_BATCH_SIZE)
+    freeze_timesteps = (
+        args_cli.freeze_policy_timesteps
+        if args_cli.pretrained_checkpoint is not None
+        else 0
+    )
     print(
         f"[PPO] num_envs={args_cli.num_envs} | n_steps={n_steps} | "
         f"transitions_per_update={effective_batch_size} | batch_size={batch_size} | "
         f"n_epochs={PPO_N_EPOCHS}"
     , flush=True)
+    freeze_learning_rate = (
+        args_cli.freeze_learning_rate
+        if args_cli.freeze_learning_rate is not None
+        else args_cli.learning_rate / 3.0
+    )
+    final_learning_rate = (
+        args_cli.final_learning_rate
+        if args_cli.final_learning_rate is not None
+        else args_cli.learning_rate / 10.0
+    )
+    lr_decay_start = int(args_cli.total_timesteps * args_cli.lr_decay_start_fraction)
+    if args_cli.lr_schedule == "low_high_cosine":
+        learning_rate = LowHighCosineSchedule(
+            total_timesteps=args_cli.total_timesteps,
+            freeze_timesteps=freeze_timesteps,
+            ramp_timesteps=args_cli.lr_ramp_timesteps,
+            decay_start_timesteps=lr_decay_start,
+            low_value=freeze_learning_rate,
+            high_value=args_cli.learning_rate,
+            final_value=final_learning_rate,
+        )
+        print(
+            "[PPO] LR schedule low-high-cosine: "
+            f"low={freeze_learning_rate:g} peak={args_cli.learning_rate:g} "
+            f"final={final_learning_rate:g} freeze_end={freeze_timesteps} "
+            f"ramp={args_cli.lr_ramp_timesteps} decay_start={lr_decay_start}",
+            flush=True,
+        )
+    else:
+        learning_rate = args_cli.learning_rate
+        print(f"[PPO] Constant learning_rate={args_cli.learning_rate:g}", flush=True)
+
+    entropy_schedule = CosineDecaySchedule(
+        total_timesteps=args_cli.total_timesteps,
+        decay_start_timesteps=int(args_cli.total_timesteps * args_cli.ent_decay_start_fraction),
+        initial_value=args_cli.ent_coef,
+        final_value=args_cli.final_ent_coef,
+    )
     print(
-        f"[PPO] learning_rate={args_cli.learning_rate:g} | ent_coef={args_cli.ent_coef:g}",
+        f"[PPO] Entropy schedule: initial={args_cli.ent_coef:g} "
+        f"final={args_cli.final_ent_coef:g} "
+        f"decay_start={entropy_schedule.decay_start_timesteps}",
         flush=True,
     )
+    print(f"[PPO] Action masking: {args_cli.action_masking}", flush=True)
     
     episode_csv_callback = EpisodeCsvLoggerCallback(episode_csv_path)
     best_terminal_distance_callback = BestTerminalDistanceCheckpointCallback(
@@ -333,35 +442,48 @@ def main_train():
         checkpoint_callback,
         episode_csv_callback,
         best_terminal_distance_callback,
+        EntropyCoefficientScheduleCallback(entropy_schedule, verbose=1),
     ]
 
-    freeze_timesteps = args_cli.freeze_policy_timesteps
+    if args_cli.freeze_policy_timesteps > 0 and args_cli.pretrained_checkpoint is None:
+        print(
+            f"[PPO] Warning: Policy freezing requested ({args_cli.freeze_policy_timesteps} timesteps), "
+            "but no pre-trained checkpoint was provided. Disabling freeze.",
+            flush=True,
+        )
     if freeze_timesteps > 0:
-        if args_cli.pretrained_checkpoint is not None:
-            print(f"[PPO] Pre-trained checkpoint loaded. Policy will be frozen for the first {freeze_timesteps} timesteps.", flush=True)
-            callbacks_list.append(FreezePolicyCallback(freeze_timesteps=freeze_timesteps))
-        else:
-            print(f"[PPO] Warning: Policy freezing requested ({freeze_timesteps} timesteps), but no pre-trained checkpoint was provided. Disabling freeze.", flush=True)
+        print(
+            f"[PPO] Pre-trained checkpoint loaded. Policy will be frozen for the first "
+            f"{freeze_timesteps} timesteps.",
+            flush=True,
+        )
+        callbacks_list.append(FreezePolicyCallback(freeze_timesteps=freeze_timesteps))
 
     callback = CallbackList(callbacks_list)
 
     policy_kwargs = dict(
-    net_arch=dict(
-        pi=[64, 64],
-        vf=[64, 64],
-    ),
-    activation_fn=nn.ReLU,
+        net_arch=dict(
+            pi=[64, 64],
+            vf=[64, 64],
+        ),
+        activation_fn=nn.ReLU,
     )
+    if args_cli.action_masking:
+        policy_kwargs["mask_task_phase"] = args_cli.task_phase
 
     if args_cli.pretrained_checkpoint is not None:
         print(f"[PPO] Loading pre-trained policy from {args_cli.pretrained_checkpoint}...", flush=True)
         custom_objects = {
-            "learning_rate": args_cli.learning_rate,
+            "learning_rate": learning_rate,
             "n_steps": n_steps,
             "batch_size": batch_size,
             "n_epochs": PPO_N_EPOCHS,
             "ent_coef": args_cli.ent_coef,
         }
+        if args_cli.action_masking:
+            custom_objects.update(
+                masked_policy_custom_objects(args_cli.pretrained_checkpoint, args_cli.task_phase)
+            )
         model = PPO.load(
             args_cli.pretrained_checkpoint,
             env=rl_env,
@@ -372,12 +494,12 @@ def main_train():
     else:
         print("[PPO] Initializing model with random weights...", flush=True)
         model = PPO(
-            "MlpPolicy",
+            MaskedMultiDiscreteActorCriticPolicy if args_cli.action_masking else "MlpPolicy",
             rl_env,
             verbose=1,
             device="cuda",
             seed=42,
-            learning_rate=args_cli.learning_rate,
+            learning_rate=learning_rate,
             n_steps=n_steps,
             batch_size=batch_size,
             n_epochs=PPO_N_EPOCHS,
@@ -412,4 +534,10 @@ def main_train():
 
 if __name__ == "__main__":
     main_train()
+    if args_cli.headless:
+        # All checkpoints and normalization statistics have been flushed.
+        # Kit shutdown can otherwise hang indefinitely in unattended jobs.
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)
     simulation_app.close()

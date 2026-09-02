@@ -13,6 +13,8 @@ from collections import deque
 
 from stable_baselines3.common.callbacks import BaseCallback
 
+from m_dVrk.hrl.schedules import CosineDecaySchedule
+
 
 class EpisodeCsvLoggerCallback(BaseCallback):
     """Log per-episode metrics to a CSV file during PPO training.
@@ -236,3 +238,33 @@ class FreezePolicyCallback(BaseCallback):
                 unfreeze_count += 1
         print(f"[PPO] Unfroze {unfreeze_count} parameters.", flush=True)
         self.policy_frozen = False
+
+
+class EntropyCoefficientScheduleCallback(BaseCallback):
+    """Update PPO's scalar entropy coefficient during training."""
+
+    def __init__(self, schedule: CosineDecaySchedule, verbose: int = 0) -> None:
+        super().__init__(verbose)
+        self.schedule = schedule
+        self._last_logged_bucket = -1
+
+    def _set_value(self) -> None:
+        value = self.schedule.value_at(self.num_timesteps)
+        self.model.ent_coef = value
+        self.logger.record("train/ent_coef_schedule", value)
+
+        bucket = int(10 * self.num_timesteps / max(1, self.schedule.total_timesteps))
+        if self.verbose > 0 and bucket != self._last_logged_bucket:
+            print(
+                f"[PPO] Entropy schedule: timestep={self.num_timesteps} "
+                f"ent_coef={value:.8g}",
+                flush=True,
+            )
+            self._last_logged_bucket = bucket
+
+    def _on_training_start(self) -> None:
+        self._set_value()
+
+    def _on_step(self) -> bool:
+        self._set_value()
+        return True

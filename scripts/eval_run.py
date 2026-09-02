@@ -1,9 +1,11 @@
 import argparse
+import csv
 import threading
 import os
 import glob
 import random
 import math
+import sys
 import numpy as np
 import torch
 import torch.nn as nn
@@ -58,6 +60,33 @@ parser.add_argument(
     type=int,
     default=42,
     help="Random seed for Python, NumPy, Torch and IsaacLab eval resets.",
+)
+parser.add_argument(
+    "--episodes",
+    type=int,
+    default=0,
+    help="Stop after this many episodes. Zero keeps the interactive infinite loop.",
+)
+parser.add_argument(
+    "--metrics_output",
+    type=str,
+    default=None,
+    help="Optional per-episode CSV output path for deterministic checkpoint ranking.",
+)
+parser.add_argument(
+    "--disable_video",
+    action="store_true",
+    help="Do not accumulate or encode evaluation videos.",
+)
+parser.add_argument(
+    "--quiet_steps",
+    action="store_true",
+    help="Suppress the per-step arm command output.",
+)
+parser.add_argument(
+    "--action_masking",
+    action="store_true",
+    help="Apply state-aware joint masking while retaining the four-component MultiDiscrete action.",
 )
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
@@ -115,6 +144,8 @@ from m_dVrk.hrl.constants import (
 )
 from m_dVrk.hrl.tcc import XIRLResnet18, load_tcc_model
 from m_dVrk.hrl.wrapper import DVRKVisionHRLWrapper
+from m_dVrk.hrl.masked_policy import masked_policy_custom_objects
+from m_dVrk.hrl.checkpoints import vecnormalize_candidates
 from m_dVrk.controllers.spartan_state_machine import SPARTANStateMachine
 from m_dVrk.controllers.ring_sync import get_scene_entity_positions_w, sync_attached_and_frozen_rings
 
@@ -129,6 +160,10 @@ def set_seed(seed=42):
         torch.cuda.manual_seed_all(seed)
 
 def main_eval():
+    if args_cli.episodes < 0:
+        raise ValueError("--episodes must be non-negative")
+    if args_cli.episodes and args_cli.num_envs != 1:
+        raise ValueError("Bounded evaluation currently requires --num_envs 1 for unambiguous episode metrics")
     env_cfg = MDvrkEnvCfg()
     env_cfg.scene.num_envs = args_cli.num_envs
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
@@ -193,20 +228,17 @@ def main_eval():
     base_no_ext, _ = os.path.splitext(checkpoint_path)
     
     vec_normalize_path = None
-    possible_paths = [
-        f"{base_no_ext}_vecnormalize.pkl",
-    ]
-    # Check for step checkpoints (e.g. dvrk_ppo_1234_steps.zip)
-    dir_name = os.path.dirname(checkpoint_path)
-    base_name = os.path.basename(checkpoint_path)
-    if base_name.startswith("dvrk_ppo_") and "_steps" in base_name:
-        steps_part = base_name.replace("dvrk_ppo_", "")
-        possible_paths.append(os.path.join(dir_name, f"dvrk_ppo_vecnormalize_{steps_part.replace('.zip', '.pkl')}"))
+    possible_paths = [str(path) for path in vecnormalize_candidates(checkpoint_path)]
     
     # also check artifacts locations
     possible_paths.extend([
         os.path.join(ARTIFACTS_DIR, "logs", "sb3", "vecnormalize.pkl"),
-        os.path.join(ARTIFACTS_DIR, "checkpoints", "ppo", os.path.basename(base_no_ext) + "_vecnormalize.pkl"),
+        os.path.join(
+            ARTIFACTS_DIR,
+            "checkpoints",
+            "ppo",
+            os.path.basename(base_no_ext) + "_vecnormalize.pkl",
+        ),
     ])
     
     for path in possible_paths:
@@ -222,8 +254,21 @@ def main_eval():
     else:
         print("[WARNING] No VecNormalize statistics found! Observations will not be normalized.")
 
+    if args_cli.action_masking and isinstance(rl_env, VecNormalize) and rl_env.norm_obs:
+        raise ValueError(
+            "--action_masking requires raw observations, but this checkpoint's VecNormalize has norm_obs=True"
+        )
+
     print(f"[INFO] Loading model from: {args_cli.checkpoint}")
-    model = PPO.load(args_cli.checkpoint, env=rl_env, device="cuda")
+    custom_objects = None
+    if args_cli.action_masking:
+        custom_objects = masked_policy_custom_objects(args_cli.checkpoint, args_cli.task_phase)
+    model = PPO.load(
+        args_cli.checkpoint,
+        env=rl_env,
+        device="cuda",
+        custom_objects=custom_objects,
+    )
     camera_sensor = rl_env.unwrapped.env.scene["camera"]
     video_frames = []
     print("[INFO] Starting evaluation...")
@@ -231,42 +276,42 @@ def main_eval():
     
     episode_count = 0
     steps = 0
+    episode_return = 0.0
+    invalid_commands = 0
+    bimanual_steps = 0
+    metric_rows = []
     while simulation_app.is_running():
         # The RL agent computes actions deterministically
         action, _states = model.predict(obs, deterministic=not args_cli.stochastic_actions)
         # Executes the step in the environment
         obs, rewards, dones, infos = rl_env.step(action)
+        episode_return += float(rewards[0])
+        invalid_commands += int(infos[0].get("invalid_command_count", 0))
         
         # Get active triplets for env 0
         cmd_l = rl_env.sm.current_triplet_l[0]
         cmd_r = rl_env.sm.current_triplet_r[0]
         str_l = f"{cmd_l['verb']} -> {cmd_l['target']}" if cmd_l else "idle -> None"
         str_r = f"{cmd_r['verb']} -> {cmd_r['target']}" if cmd_r else "idle -> None"
-        print(f"[Step {steps:03d}] Left Arm: {str_l:<20} | Right Arm: {str_r:<20}")
+        if cmd_l is not None and cmd_r is not None:
+            bimanual_steps += 1
+        if not args_cli.quiet_steps:
+            print(f"[Step {steps:03d}] Left Arm: {str_l:<20} | Right Arm: {str_r:<20}")
 
         # Retrieve virtual camera frame (H, W, 4) or (H, W, 3)
-        rgb_data = camera_sensor.data.output["rgb"][0]
-        
-        # Convert to a writable 3-channel numpy array on CPU for drawing
-        frame_np = rgb_data.cpu().numpy()[:, :, :3].copy()
-        
-        # Draw a semi-transparent HUD background banner at the top
-        overlay = frame_np.copy()
-        cv2.rectangle(overlay, (0, 0), (frame_np.shape[1], 75), (0, 0, 0), -1)
-        cv2.addWeighted(overlay, 0.4, frame_np, 0.6, 0, frame_np)
-        
-        # Draw Left Arm (Green) and Right Arm (Cyan) triplets
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        cv2.putText(frame_np, f"LEFT ARM:  {str_l.upper()}", (15, 30), font, 0.6, (50, 255, 50), 2, cv2.LINE_AA)
-        cv2.putText(frame_np, f"RIGHT ARM: {str_r.upper()}", (15, 55), font, 0.6, (50, 200, 255), 2, cv2.LINE_AA)
-        
-        # Draw Step Counter (White) and Reward (Yellow-Gold)
-        cv2.putText(frame_np, f"STEP: {steps:03d}", (frame_np.shape[1] - 150, 30), font, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
-        cv2.putText(frame_np, f"REWARD: {rewards[0]:.4f}", (frame_np.shape[1] - 200, 55), font, 0.6, (100, 230, 255), 2, cv2.LINE_AA)
-        
-        # Convert back to PyTorch CPU tensor and append
-        frame = torch.from_numpy(frame_np)
-        video_frames.append(frame)
+        if not args_cli.disable_video:
+            rgb_data = camera_sensor.data.output["rgb"][0]
+            frame_np = rgb_data.cpu().numpy()[:, :, :3].copy()
+            overlay = frame_np.copy()
+            cv2.rectangle(overlay, (0, 0), (frame_np.shape[1], 75), (0, 0, 0), -1)
+            cv2.addWeighted(overlay, 0.4, frame_np, 0.6, 0, frame_np)
+
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            cv2.putText(frame_np, f"LEFT ARM:  {str_l.upper()}", (15, 30), font, 0.6, (50, 255, 50), 2, cv2.LINE_AA)
+            cv2.putText(frame_np, f"RIGHT ARM: {str_r.upper()}", (15, 55), font, 0.6, (50, 200, 255), 2, cv2.LINE_AA)
+            cv2.putText(frame_np, f"STEP: {steps:03d}", (frame_np.shape[1] - 150, 30), font, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+            cv2.putText(frame_np, f"REWARD: {rewards[0]:.4f}", (frame_np.shape[1] - 200, 55), font, 0.6, (100, 230, 255), 2, cv2.LINE_AA)
+            video_frames.append(torch.from_numpy(frame_np))
         
         # Save video when episode terminates (at reset)
         if dones[0]:
@@ -278,6 +323,25 @@ def main_eval():
                 f"blue={info0.get('blue_peg_ring_count', 0)} "
                 f"green={info0.get('green_peg_ring_count', 0)} "
                 f"distance={info0.get('terminal_distance', float('nan')):.4f}"
+            )
+
+            metric_rows.append(
+                {
+                    "checkpoint": os.path.abspath(args_cli.checkpoint),
+                    "seed": args_cli.seed,
+                    "episode": episode_count,
+                    "deterministic": not args_cli.stochastic_actions,
+                    "action_masking": args_cli.action_masking,
+                    "success": bool(info0.get("is_success", False)),
+                    "episode_steps": steps + 1,
+                    "episode_return": episode_return,
+                    "terminal_distance": float(info0.get("terminal_distance", float("nan"))),
+                    "green_peg_ring_count": int(info0.get("green_peg_ring_count", 0)),
+                    "red_peg_ring_count": int(info0.get("red_peg_ring_count", 0)),
+                    "blue_peg_ring_count": int(info0.get("blue_peg_ring_count", 0)),
+                    "invalid_commands": invalid_commands,
+                    "bimanual_steps": bimanual_steps,
+                }
             )
             
             # Save video
@@ -292,9 +356,32 @@ def main_eval():
             
             episode_count += 1
             steps = 0
+            episode_return = 0.0
+            invalid_commands = 0
+            bimanual_steps = 0
+            if args_cli.episodes and episode_count >= args_cli.episodes:
+                break
         else:
             steps += 1
 
+    if args_cli.metrics_output is not None:
+        output_dir = os.path.dirname(os.path.abspath(args_cli.metrics_output))
+        os.makedirs(output_dir, exist_ok=True)
+        with open(args_cli.metrics_output, "w", newline="", encoding="utf-8") as stream:
+            if metric_rows:
+                writer = csv.DictWriter(stream, fieldnames=list(metric_rows[0]))
+                writer.writeheader()
+                writer.writerows(metric_rows)
+        print(f"[INFO] Evaluation metrics saved: {args_cli.metrics_output}")
+
 if __name__ == "__main__":
     main_eval()
+    if args_cli.episodes:
+        # Isaac/Kit can block indefinitely during shutdown in headless batch
+        # evaluation. All result files are closed at this point; an immediate
+        # process exit also guarantees that GPU resources are released before
+        # the checkpoint ranker launches the next candidate.
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)
     simulation_app.close()
