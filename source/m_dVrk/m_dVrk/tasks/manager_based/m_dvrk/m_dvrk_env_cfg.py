@@ -397,6 +397,7 @@ class EventCfg:
             "yaw_range": (-3.14, 3.14),
             "max_sample_attempts": 256,
             "randomize": True,
+            "randomization_scale": 1.0,
             "fixed_ring_poses": {
                 "ring_red": (0.335, -0.055, 0.717, 0.0),
                 "ring_yellow": (0.362, -0.055, 0.717, 0.0),

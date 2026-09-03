@@ -8,6 +8,8 @@ import isaaclab.utils.math as math_utils
 from isaaclab.assets import Articulation, RigidObject
 from isaaclab.envs import ManagerBasedEnv
 
+from m_dVrk.hrl.curriculum import scaled_interval_around_anchor
+
 
 def _resolve_asset_prim_path(env: ManagerBasedEnv, asset_name: str, env_id: int) -> str:
     prim_path = env.scene[asset_name].cfg.prim_path
@@ -185,6 +187,7 @@ def reset_rings_on_board(
     yaw_range: tuple[float, float] = (-math.pi, math.pi),
     max_sample_attempts: int = 64,
     randomize: bool = True,
+    randomization_scale: float = 1.0,
     fixed_ring_poses: dict[str, tuple[float, float, float, float]] | None = None,
 ):
     """Reset all rings jointly on the board while avoiding pegs and mutual overlaps.
@@ -195,6 +198,9 @@ def reset_rings_on_board(
     """
 
     device = env.device
+    scale = float(getattr(env, "ring_randomization_scale", randomization_scale))
+    if not 0.0 <= scale <= 1.0:
+        raise ValueError("ring randomization scale must be in [0, 1]")
     env_origins = env.scene.env_origins[env_ids]
 
     peg_positions_local = []
@@ -212,7 +218,7 @@ def reset_rings_on_board(
         for ring_name in ring_names:
             fixed_pose = None if fixed_ring_poses is None else fixed_ring_poses.get(ring_name)
 
-            if not randomize and fixed_pose is not None:
+            if (not randomize or scale == 0.0) and fixed_pose is not None:
                 best_candidate = torch.tensor(fixed_pose[:3], device=device)
                 yaw = float(fixed_pose[3])
                 is_valid, margin = _candidate_margin(
@@ -228,12 +234,28 @@ def reset_rings_on_board(
                         f"clearance margin {margin:.4f} in env {env_id}."
                     )
             elif randomize:
+                ring_x_range = x_range
+                ring_y_range = y_range
+                ring_yaw_range = yaw_range
+                if fixed_pose is not None and scale < 1.0:
+                    ring_x_range = scaled_interval_around_anchor(
+                        float(fixed_pose[0]), x_range, scale
+                    )
+                    ring_y_range = scaled_interval_around_anchor(
+                        float(fixed_pose[1]), y_range, scale
+                    )
+                    ring_yaw_range = scaled_interval_around_anchor(
+                        float(fixed_pose[3]), yaw_range, scale
+                    )
+
                 best_candidate = None
                 best_margin = -float("inf")
                 found_valid_candidate = False
 
                 for _ in range(max_sample_attempts):
-                    candidate = _sample_ring_candidate(device, x_range, y_range, z_height)
+                    candidate = _sample_ring_candidate(
+                        device, ring_x_range, ring_y_range, z_height
+                    )
                     is_valid, margin = _candidate_margin(
                         candidate[:2],
                         peg_positions_xy,
@@ -254,8 +276,8 @@ def reset_rings_on_board(
                 if best_candidate is None:
                     best_candidate = _select_fallback_candidate(
                         device,
-                        x_range,
-                        y_range,
+                        ring_x_range,
+                        ring_y_range,
                         z_height,
                         peg_positions_xy,
                         placed_positions_xy,
@@ -266,8 +288,8 @@ def reset_rings_on_board(
                 if not found_valid_candidate and best_margin < 0.0:
                     best_candidate = _select_fallback_candidate(
                         device,
-                        x_range,
-                        y_range,
+                        ring_x_range,
+                        ring_y_range,
                         z_height,
                         peg_positions_xy,
                         placed_positions_xy,
@@ -275,7 +297,9 @@ def reset_rings_on_board(
                         min_ring_clearance,
                     )
 
-                yaw = torch.empty(1, device=device).uniform_(yaw_range[0], yaw_range[1]).item()
+                yaw = torch.empty(1, device=device).uniform_(
+                    ring_yaw_range[0], ring_yaw_range[1]
+                ).item()
             else:
                 best_candidate = _select_fallback_candidate(
                     device,

@@ -589,6 +589,9 @@ class DVRKVisionHRLWrapper(VecEnv):
             infos[idx]["rings_complete"]       = bool(rings_complete[idx].item())
             infos[idx]["terminal_distance"]    = float(rew_distance_raw[idx].item())
             infos[idx]["green_peg_ring_count"] = int(green_peg_ring_count[idx].item())
+            infos[idx]["ring_randomization_scale"] = float(
+                getattr(self.env, "ring_randomization_scale", 0.0)
+            )
             if self.task_phase == "phase_1":
                 infos[idx]["red_peg_ring_count"]  = int(
                     peg_ring_count(self.sm, PEG_RED,  self._ring_names, self.num_envs, self.env.device)[idx].item()
