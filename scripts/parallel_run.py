@@ -599,8 +599,24 @@ def main_train():
     print("[PPO] Model initialized. Starting learn()...", flush=True)
     model.learn(total_timesteps=args_cli.total_timesteps, log_interval=1, callback=callback)
     print("[PPO] learn() completed. Saving final model...", flush=True)
-    os.makedirs(os.path.join(ARTIFACTS_DIR, "checkpoints", "ppo"), exist_ok=True)
-    model.save(os.path.join(ARTIFACTS_DIR, "checkpoints", "ppo", "dvrk_ppo_finale"))
+    checkpoint_dir = os.path.join(ARTIFACTS_DIR, "checkpoints", "ppo")
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    final_stem = (
+        f"dvrk_ppo_finale_{args_cli.task_phase}{log_suffix}"
+        if log_suffix
+        else "dvrk_ppo_finale"
+    )
+    final_model_path = os.path.join(checkpoint_dir, final_stem)
+    final_vecnormalize_path = os.path.join(
+        checkpoint_dir, f"{final_stem}_vecnormalize.pkl"
+    )
+    model.save(final_model_path)
+    rl_env.save(final_vecnormalize_path)
+    print(f"[PPO] Final model saved: {final_model_path}.zip", flush=True)
+    print(
+        f"[PPO] Final VecNormalize saved: {final_vecnormalize_path}",
+        flush=True,
+    )
 
     rl_env.save(vec_normalize_path)
 
