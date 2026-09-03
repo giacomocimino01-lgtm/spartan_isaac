@@ -88,6 +88,7 @@ OBS_DIM: int = STACK_SIZE * EMB_DIM + AUX_DIM + GEOM_DIM  # 244
 # ---------------------------------------------------------------------------
 
 INVALID_COMMAND_PENALTY: float = 1.0
+SUCCESS_BONUS: float = 100.0
 
 # Episode CSV logging
 EPISODE_CSV_FILENAME: str = "episode_progress.csv"

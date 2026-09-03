@@ -37,6 +37,7 @@ constants = load_module("m_dVrk.hrl.constants", PACKAGE_ROOT / "hrl" / "constant
 schedules = load_module("m_dVrk.hrl.schedules", PACKAGE_ROOT / "hrl" / "schedules.py")
 masked_policy = load_module("m_dVrk.hrl.masked_policy", PACKAGE_ROOT / "hrl" / "masked_policy.py")
 checkpoints = load_module("m_dVrk.hrl.checkpoints", PACKAGE_ROOT / "hrl" / "checkpoints.py")
+rewards = load_module("m_dVrk.hrl.rewards", PACKAGE_ROOT / "hrl" / "rewards.py")
 
 
 def put_action_one_hot(obs: torch.Tensor, offset: int, action: list[int]) -> None:
@@ -104,6 +105,30 @@ class CheckpointTests(unittest.TestCase):
     def test_final_checkpoint_vecnormalize_name(self) -> None:
         candidates = checkpoints.vecnormalize_candidates("/tmp/dvrk_ppo_finale.zip")
         self.assertEqual(candidates[0].name, "dvrk_ppo_finale_vecnormalize.pkl")
+
+
+class RewardTests(unittest.TestCase):
+    def test_success_bonus_is_applied_only_to_successful_environments(self) -> None:
+        embeddings = torch.tensor([[1.0, 0.0], [1.0, 0.0]])
+        goal = torch.zeros(2)
+        invalid = torch.zeros(2)
+        result = rewards.compute_tcc_reward(
+            embeddings,
+            goal,
+            invalid,
+            success_mask=torch.tensor([True, False]),
+        )
+        self.assertAlmostEqual(result[0].item(), 99.999, places=5)
+        self.assertAlmostEqual(result[1].item(), -0.001, places=5)
+
+    def test_success_bonus_does_not_replace_invalid_command_penalty(self) -> None:
+        result = rewards.compute_tcc_reward(
+            torch.zeros((1, 2)),
+            torch.zeros(2),
+            torch.ones(1),
+            success_mask=torch.ones(1, dtype=torch.bool),
+        )
+        self.assertEqual(result.item(), 99.0)
 
 
 class ActionMaskTests(unittest.TestCase):

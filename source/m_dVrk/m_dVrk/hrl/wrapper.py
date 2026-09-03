@@ -520,8 +520,7 @@ class DVRKVisionHRLWrapper(VecEnv):
 
         self.current_step += 1
 
-        # --- Reward ---
-        rewards = compute_tcc_reward(new_embs, self.goal_embedding, invalid_command_counts)
+        # Raw TCC distance is logged independently from the shaped reward.
         rew_distance_raw = tcc_distance(new_embs, self.goal_embedding)
 
         # --- Success / settle ---
@@ -537,6 +536,16 @@ class DVRKVisionHRLWrapper(VecEnv):
         self.settle_steps_remaining[settling] -= 1
         settled_success = rings_complete & (self.settle_steps_remaining == 0)
         task_success_flag = settled_success | (rings_complete & isaac_done)
+
+        # --- Reward ---
+        # The terminal bonus is tied to logical completion (all required rings
+        # on their target pegs), not merely to a small visual embedding distance.
+        rewards = compute_tcc_reward(
+            new_embs,
+            self.goal_embedding,
+            invalid_command_counts,
+            success_mask=task_success_flag,
+        )
 
         if task_success_flag.any():
             self._maybe_dump_success_assets(task_success_flag, rgb_data)
