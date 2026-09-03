@@ -178,6 +178,11 @@ class DVRKVisionHRLWrapper(VecEnv):
         )
         self.preprocess = T.Compose([T.Resize((112, 112), antialias=True)])
         self.current_step = torch.zeros(self.num_envs, dtype=torch.long, device=self.env.device)
+        self.episode_ring_randomization_scale = np.full(
+            self.num_envs,
+            float(getattr(self.env, "ring_randomization_scale", 0.0)),
+            dtype=np.float32,
+        )
         self.goal_embedding = None
         self.actions = None
 
@@ -350,6 +355,9 @@ class DVRKVisionHRLWrapper(VecEnv):
     def reset(self) -> np.ndarray:
         self.env.reset()
         self.current_step[:] = 0
+        self.episode_ring_randomization_scale.fill(
+            float(getattr(self.env, "ring_randomization_scale", 0.0))
+        )
 
         for i in range(self.num_envs):
             self.sm.reset_env(i, phase=self.task_phase)
@@ -589,6 +597,9 @@ class DVRKVisionHRLWrapper(VecEnv):
             infos[idx]["rings_complete"]       = bool(rings_complete[idx].item())
             infos[idx]["terminal_distance"]    = float(rew_distance_raw[idx].item())
             infos[idx]["green_peg_ring_count"] = int(green_peg_ring_count[idx].item())
+            infos[idx]["ring_randomization_scale"] = float(
+                self.episode_ring_randomization_scale[idx]
+            )
             if self.task_phase == "phase_1":
                 infos[idx]["red_peg_ring_count"]  = int(
                     peg_ring_count(self.sm, PEG_RED,  self._ring_names, self.num_envs, self.env.device)[idx].item()
@@ -613,6 +624,9 @@ class DVRKVisionHRLWrapper(VecEnv):
                 )
                 self.sm.reset_env(idx, phase=self.task_phase)
                 self.current_step[idx] = 0
+                self.episode_ring_randomization_scale[idx] = float(
+                    getattr(self.env, "ring_randomization_scale", 0.0)
+                )
                 self.settle_steps_remaining[idx] = 0
                 self.prev_actions[idx] = IDLE_ACTION.to(self.env.device)
                 self.last_override_flags[idx] = 0.0

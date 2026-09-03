@@ -13,6 +13,7 @@ from collections import deque
 
 from stable_baselines3.common.callbacks import BaseCallback
 
+from m_dVrk.hrl.curriculum import RingRandomizationCurriculum
 from m_dVrk.hrl.schedules import CosineDecaySchedule
 
 
@@ -52,6 +53,7 @@ class EpisodeCsvLoggerCallback(BaseCallback):
                 "red_peg_ring_count",
                 "blue_peg_ring_count",
                 "time_limit_truncated",
+                "ring_randomization_scale",
             ],
         )
         self._writer.writeheader()
@@ -83,6 +85,9 @@ class EpisodeCsvLoggerCallback(BaseCallback):
                     "red_peg_ring_count": int(info.get("red_peg_ring_count", 0)),
                     "blue_peg_ring_count": int(info.get("blue_peg_ring_count", 0)),
                     "time_limit_truncated": bool(info.get("TimeLimit.truncated", False)),
+                    "ring_randomization_scale": float(
+                        info.get("ring_randomization_scale", float("nan"))
+                    ),
                 }
             )
             wrote_rows = True
@@ -267,4 +272,40 @@ class EntropyCoefficientScheduleCallback(BaseCallback):
 
     def _on_step(self) -> bool:
         self._set_value()
+        return True
+
+
+class RingRandomizationCurriculumCallback(BaseCallback):
+    """Update the ring-reset randomization scale during PPO training."""
+
+    def __init__(
+        self,
+        raw_env: object,
+        schedule: RingRandomizationCurriculum,
+        verbose: int = 0,
+    ) -> None:
+        super().__init__(verbose)
+        self.raw_env = raw_env
+        self.schedule = schedule
+        self._last_logged_bucket = -1
+
+    def _set_scale(self) -> None:
+        scale = self.schedule.value_at(self.num_timesteps)
+        setattr(self.raw_env, "ring_randomization_scale", scale)
+        self.logger.record("curriculum/ring_randomization_scale", scale)
+
+        bucket = int(scale * 10)
+        if self.verbose > 0 and bucket != self._last_logged_bucket:
+            print(
+                f"[PPO] Ring curriculum: timestep={self.num_timesteps} "
+                f"randomization_scale={scale:.4f}",
+                flush=True,
+            )
+            self._last_logged_bucket = bucket
+
+    def _on_training_start(self) -> None:
+        self._set_scale()
+
+    def _on_step(self) -> bool:
+        self._set_scale()
         return True

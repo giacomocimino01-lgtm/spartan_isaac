@@ -55,6 +55,9 @@ sys.modules.setdefault("m_dVrk.controllers.ring_sync", ring_sync_module)
 
 constants = load_module("m_dVrk.hrl.constants", PACKAGE_ROOT / "hrl" / "constants.py")
 schedules = load_module("m_dVrk.hrl.schedules", PACKAGE_ROOT / "hrl" / "schedules.py")
+curriculum = load_module(
+    "m_dVrk.hrl.curriculum", PACKAGE_ROOT / "hrl" / "curriculum.py"
+)
 masked_policy = load_module("m_dVrk.hrl.masked_policy", PACKAGE_ROOT / "hrl" / "masked_policy.py")
 checkpoints = load_module("m_dVrk.hrl.checkpoints", PACKAGE_ROOT / "hrl" / "checkpoints.py")
 rewards = load_module("m_dVrk.hrl.rewards", PACKAGE_ROOT / "hrl" / "rewards.py")
@@ -124,6 +127,37 @@ class ScheduleTests(unittest.TestCase):
         self.assertEqual(schedule.value_at(50), 0.001)
         self.assertEqual(schedule.value_at(70), 0.001)
         self.assertAlmostEqual(schedule.value_at(100), 0.0)
+
+    def test_ring_curriculum_boundaries(self) -> None:
+        schedule = curriculum.RingRandomizationCurriculum(
+            total_timesteps=5_000_000,
+            start_timesteps=500_000,
+            full_timesteps=3_500_000,
+        )
+        self.assertEqual(schedule.value_at(0), 0.0)
+        self.assertEqual(schedule.value_at(500_000), 0.0)
+        self.assertAlmostEqual(schedule.value_at(2_000_000), 0.5)
+        self.assertEqual(schedule.value_at(3_500_000), 1.0)
+        self.assertEqual(schedule.value_at(5_000_000), 1.0)
+
+    def test_ring_sampling_interval_expands_from_fixed_pose(self) -> None:
+        full = (0.318, 0.432)
+        anchor = 0.335
+        self.assertEqual(
+            curriculum.scaled_interval_around_anchor(anchor, full, 0.0),
+            (anchor, anchor),
+        )
+        self.assertEqual(
+            curriculum.scaled_interval_around_anchor(anchor, full, 1.0),
+            full,
+        )
+        lower, upper = curriculum.scaled_interval_around_anchor(anchor, full, 0.5)
+        self.assertAlmostEqual(lower, 0.3265)
+        self.assertAlmostEqual(upper, 0.3835)
+
+    def test_ring_curriculum_rejects_invalid_boundaries(self) -> None:
+        with self.assertRaises(ValueError):
+            curriculum.RingRandomizationCurriculum(100, 80, 80)
 
 
 class CheckpointTests(unittest.TestCase):

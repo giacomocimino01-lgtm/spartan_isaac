@@ -38,6 +38,26 @@ parser.add_argument(
     help="Randomize ring reset positions. By default, rings reset to a fixed deterministic layout.",
 )
 parser.add_argument(
+    "--ring_curriculum",
+    action="store_true",
+    help=(
+        "Progressively expand ring reset positions from the fixed layout to the "
+        "full randomized workspace. Mutually exclusive with --randomize_rings."
+    ),
+)
+parser.add_argument(
+    "--ring_curriculum_start_fraction",
+    type=float,
+    default=0.10,
+    help="Training fraction kept at the fixed layout before ring randomization begins.",
+)
+parser.add_argument(
+    "--ring_curriculum_full_fraction",
+    type=float,
+    default=0.70,
+    help="Training fraction at which the full ring randomization area is reached.",
+)
+parser.add_argument(
     "--pretrained_checkpoint",
     type=str,
     default=None,
@@ -180,12 +200,14 @@ from m_dVrk.hrl.callbacks import (
     BestTerminalDistanceCheckpointCallback,
     FreezePolicyCallback,
     EntropyCoefficientScheduleCallback,
+    RingRandomizationCurriculumCallback,
 )
 from m_dVrk.hrl.masked_policy import (
     MaskedMultiDiscreteActorCriticPolicy,
     masked_policy_custom_objects,
 )
 from m_dVrk.hrl.schedules import CosineDecaySchedule, LowHighCosineSchedule
+from m_dVrk.hrl.curriculum import RingRandomizationCurriculum
 from m_dVrk.controllers.spartan_state_machine import SPARTANStateMachine
 
 # (All constants are now imported from m_dVrk.hrl.constants above)
@@ -257,24 +279,66 @@ def main_train():
         raise ValueError("--lr_decay_start_fraction must be in [0, 1]")
     if not 0.0 <= args_cli.ent_decay_start_fraction <= 1.0:
         raise ValueError("--ent_decay_start_fraction must be in [0, 1]")
+    if args_cli.ring_curriculum and args_cli.randomize_rings:
+        raise ValueError("--ring_curriculum and --randomize_rings are mutually exclusive")
+    if args_cli.ring_curriculum and not (
+        0.0
+        <= args_cli.ring_curriculum_start_fraction
+        < args_cli.ring_curriculum_full_fraction
+        <= 1.0
+    ):
+        raise ValueError(
+            "ring curriculum fractions must satisfy "
+            "0 <= start < full <= 1"
+        )
     if args_cli.action_masking and not args_cli.disable_obs_normalization:
         raise ValueError(
             "--action_masking currently requires --disable_obs_normalization because "
             "the mask reads the categorical state fields from the raw 244-D observation."
         )
+    ring_curriculum_schedule = None
+    if args_cli.ring_curriculum:
+        ring_curriculum_schedule = RingRandomizationCurriculum(
+            total_timesteps=args_cli.total_timesteps,
+            start_timesteps=int(
+                args_cli.total_timesteps * args_cli.ring_curriculum_start_fraction
+            ),
+            full_timesteps=int(
+                args_cli.total_timesteps * args_cli.ring_curriculum_full_fraction
+            ),
+        )
+
     env_cfg = MDvrkEnvCfg()
     env_cfg.scene.num_envs = args_cli.num_envs
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
     env_cfg.num_rerenders_on_reset = 2
     env_cfg.wait_for_textures = False
     env_cfg.seed = 42
-    env_cfg.events.reset_rings.params["randomize"] = bool(args_cli.randomize_rings)
-    print(
-        "[INFO] Ring reset mode: "
-        f"{'randomized' if args_cli.randomize_rings else 'fixed deterministic'}"
+    env_cfg.events.reset_rings.params["randomize"] = bool(
+        args_cli.randomize_rings or args_cli.ring_curriculum
     )
+    initial_ring_randomization_scale = (
+        ring_curriculum_schedule.value_at(0)
+        if ring_curriculum_schedule is not None
+        else float(args_cli.randomize_rings)
+    )
+    env_cfg.events.reset_rings.params["randomization_scale"] = (
+        initial_ring_randomization_scale
+    )
+    if ring_curriculum_schedule is not None:
+        print(
+            "[INFO] Ring reset mode: curriculum "
+            f"(fixed through {ring_curriculum_schedule.start_timesteps}, "
+            f"full randomization at {ring_curriculum_schedule.full_timesteps})"
+        )
+    else:
+        print(
+            "[INFO] Ring reset mode: "
+            f"{'randomized' if args_cli.randomize_rings else 'fixed deterministic'}"
+        )
     print(f"[INFO] Simulation device: {env_cfg.sim.device}")
     isaac_env = ManagerBasedRLEnv(cfg=env_cfg)
+    isaac_env.ring_randomization_scale = initial_ring_randomization_scale
 
     # DEBUG: inspect scene entities
     print("\n[DEBUG] Scene entity types:")
@@ -444,6 +508,14 @@ def main_train():
         best_terminal_distance_callback,
         EntropyCoefficientScheduleCallback(entropy_schedule, verbose=1),
     ]
+    if ring_curriculum_schedule is not None:
+        callbacks_list.append(
+            RingRandomizationCurriculumCallback(
+                raw_env=isaac_env,
+                schedule=ring_curriculum_schedule,
+                verbose=1,
+            )
+        )
 
     if args_cli.freeze_policy_timesteps > 0 and args_cli.pretrained_checkpoint is None:
         print(
