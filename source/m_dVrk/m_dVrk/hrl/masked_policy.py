@@ -28,6 +28,16 @@ _GEOMETRY_OFFSET = _BUSY_OFFSET + 2 + 2 + 2
 _ATTACHED_RIGHT_OFFSET = _GEOMETRY_OFFSET + 66
 _ATTACHED_LEFT_OFFSET = _GEOMETRY_OFFSET + 70
 _MANIPULABLE_OFFSET = _GEOMETRY_OFFSET + 82
+_RING_POSITION_OFFSET = _GEOMETRY_OFFSET + 6
+
+# Local robot-root positions from MDvrkEnvCfg. A planar radius of 0.22 m
+# retains an overlap region around the board centre while excluding only the
+# diagonally opposite corners that repeatedly trap the IK controller.
+_ARM_ROOT_XY = {
+    "right": (0.25, -0.15),
+    "left": (0.50, -0.15),
+}
+_MAX_RING_PLANAR_REACH = 0.22
 
 
 def _decode_action_one_hot(obs: torch.Tensor, offset: int) -> torch.Tensor:
@@ -79,6 +89,9 @@ def build_joint_action_mask(
     attached_right = obs[:, _ATTACHED_RIGHT_OFFSET : _ATTACHED_RIGHT_OFFSET + 4] > 0.5
     attached_left = obs[:, _ATTACHED_LEFT_OFFSET : _ATTACHED_LEFT_OFFSET + 4] > 0.5
     manipulable = obs[:, _MANIPULABLE_OFFSET : _MANIPULABLE_OFFSET + 4] > 0.5
+    ring_positions = obs[:, _RING_POSITION_OFFSET : _RING_POSITION_OFFSET + 12].reshape(
+        batch_size, 4, 3
+    )
 
     idle_id = VERB_TO_ID["idle"]
     reach_id = VERB_TO_ID["reach"]
@@ -110,13 +123,26 @@ def build_joint_action_mask(
         target_is_peg = (target.unsqueeze(-1) == peg_ids.view(1, 1, -1)).any(dim=-1)
         ring_index = target.clamp(min=0, max=3).expand(batch_size, -1)
         target_manipulable = torch.gather(manipulable, 1, ring_index) & target_is_ring
+        target_ring_xy = torch.gather(
+            ring_positions[:, :, :2],
+            1,
+            ring_index.unsqueeze(-1).expand(-1, -1, 2),
+        )
+        arm_root_xy = torch.tensor(_ARM_ROOT_XY[arm], device=device, dtype=obs.dtype)
+        target_reachable = (
+            torch.linalg.vector_norm(target_ring_xy - arm_root_xy, dim=-1)
+            <= _MAX_RING_PLANAR_REACH
+        ) & target_is_ring
 
         idle_ok = (verb == idle_id) & (target == none_id)
-        reach_ring_ok = (verb == reach_id) & target_manipulable & ~holds_ring
+        reach_ring_ok = (
+            (verb == reach_id) & target_manipulable & target_reachable & ~holds_ring
+        )
         reach_peg_ok = (verb == reach_id) & target_is_peg & holds_ring
         grasp_ok = (
             (verb == grasp_id)
             & target_manipulable
+            & target_reachable
             & ~holds_ring
             & (previous_verb == reach_id)
             & (previous_target == target)

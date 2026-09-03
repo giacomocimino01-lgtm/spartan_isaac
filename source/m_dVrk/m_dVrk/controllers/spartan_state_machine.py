@@ -40,7 +40,13 @@ INITIAL_PHASE_BY_VERB: dict[str, str] = {
 }
 
 VALID_PHASES_BY_VERB: dict[str, set[str]] = {
-    "reach":   {"MOVE_TO_REACH_ENTRY", "APPROACH_ABOVE", "DESCEND", "SETTLE"},
+    "reach":   {
+        "MOVE_TO_REACH_ENTRY",
+        "APPROACH_ABOVE",
+        "DESCEND",
+        "SETTLE",
+        "RECOVER_TO_ENTRY",
+    },
     "grasp":   {"CLOSE_GRIPPER", "LIFT_UP"},
     "release": {"OPEN_GRIPPER"},
 }
@@ -67,6 +73,8 @@ class SPARTANStateMachine:
     GRASP_ATTACH_DISTANCE: float = 0.015
     GRASP_CLOSE_MIN_STEPS: int = 10
     GRASP_TIMEOUT_STEPS: int = 220
+    REACH_PHASE_TIMEOUT_STEPS: int = 120
+    REACH_RECOVERY_TIMEOUT_STEPS: int = 120
     RELEASE_PEG_CAPTURE_DISTANCE: float = 0.015
     BOARD_RELEASE_Z_OFFSET: float = 0.0
     LINEAR_SPEED: float = 0.02
@@ -245,6 +253,22 @@ class SPARTANStateMachine:
             device=self.device,
         )
         return origin + local_entry
+
+    def _start_reach_recovery(
+        self,
+        sub_state: list[str],
+        step_counter: list[int],
+        env_id: int,
+        subject: str,
+        target_name: str,
+        failed_phase: str,
+    ) -> None:
+        if self.debug_mode:
+            print(
+                f"[DEBUG SM] Env {env_id} - {subject} reach timeout for "
+                f"{target_name} in {failed_phase}; recovering to entry."
+            )
+        self._set_phase(sub_state, step_counter, env_id, "RECOVER_TO_ENTRY")
 
     def _resolve_release_target(
         self, target_name: str | None, last_target: str | None
@@ -437,6 +461,11 @@ class SPARTANStateMachine:
                 )
                 return
 
+            if verb == "reach":
+                # A new attempt must earn its own successful last_target. This
+                # prevents a timed-out retry to the same target from inheriting
+                # stale reach state and incorrectly enabling grasp/release.
+                self.last_target_r[env_id] = None
             self._set_phase(self.sub_state_r, self.step_counter_r, env_id, INITIAL_PHASE_BY_VERB[verb])
             if verb in ("reach", "grasp"):
                 self.target_pos_r[env_id] = self.get_target_coordinates(target, subject, env_id)
@@ -465,6 +494,8 @@ class SPARTANStateMachine:
                 )
                 return
 
+            if verb == "reach":
+                self.last_target_l[env_id] = None
             self._set_phase(self.sub_state_l, self.step_counter_l, env_id, INITIAL_PHASE_BY_VERB[verb])
             if verb in ("reach", "grasp"):
                 self.target_pos_l[env_id] = self.get_target_coordinates(target, subject, env_id)
@@ -613,23 +644,35 @@ class SPARTANStateMachine:
             if phase == "MOVE_TO_REACH_ENTRY":
                 dest = self._get_reach_entry_position(subject, i)
                 act[i, 0:3] = self._get_fixed_speed_cmd(tip[i], dest)
-                if self._tip_reached(tip[i], dest) or step_counter[i] > 400:
+                if self._tip_reached(tip[i], dest):
                     self._set_phase(sub_state, step_counter, i, "APPROACH_ABOVE")
+                elif step_counter[i] >= self.REACH_PHASE_TIMEOUT_STEPS:
+                    self._start_reach_recovery(
+                        sub_state, step_counter, i, subject, target_name, phase
+                    )
             elif phase == "APPROACH_ABOVE":
                 target_pos[i] = self.get_target_coordinates(target_name, subject, i)
                 dest = target_pos[i] + torch.tensor([0.0, 0.0, self.SAFE_Z_OFFSET], device=self.device)
                 act[i, 0:3] = self._get_fixed_speed_cmd(tip[i], dest)
-                if self._tip_reached(tip[i], dest) or step_counter[i] > 400:
+                if self._tip_reached(tip[i], dest):
                     if self._is_peg_target(target_name):
                         self._set_phase(sub_state, step_counter, i, "SETTLE")
                     else:
                         self._set_phase(sub_state, step_counter, i, "DESCEND")
+                elif step_counter[i] >= self.REACH_PHASE_TIMEOUT_STEPS:
+                    self._start_reach_recovery(
+                        sub_state, step_counter, i, subject, target_name, phase
+                    )
             elif phase == "DESCEND":
                 target_pos[i] = self.get_target_coordinates(target_name, subject, i)
                 dest = target_pos[i] + torch.tensor([0.0, 0.0, self.GRASP_Z_OFFSET], device=self.device)
                 act[i, 0:3] = self._get_fixed_speed_cmd(tip[i], dest)
                 if self._tip_reached(tip[i], dest):
                     self._set_phase(sub_state, step_counter, i, "SETTLE")
+                elif step_counter[i] >= self.REACH_PHASE_TIMEOUT_STEPS:
+                    self._start_reach_recovery(
+                        sub_state, step_counter, i, subject, target_name, phase
+                    )
             elif phase == "SETTLE":
                 target_pos[i] = self.get_target_coordinates(target_name, subject, i)
                 dest = target_pos[i] + torch.tensor([0.0, 0.0, settle_offset], device=self.device)
@@ -637,6 +680,16 @@ class SPARTANStateMachine:
                 if step_counter[i] > 15:
                     last_target[i] = target_name
                     self._finish_command(active_verb, sub_state, step_counter, i, current_triplet)
+            elif phase == "RECOVER_TO_ENTRY":
+                dest = self._get_reach_entry_position(subject, i)
+                act[i, 0:3] = self._get_fixed_speed_cmd(tip[i], dest)
+                if (
+                    self._tip_reached(tip[i], dest)
+                    or step_counter[i] >= self.REACH_RECOVERY_TIMEOUT_STEPS
+                ):
+                    self._finish_command(
+                        active_verb, sub_state, step_counter, i, current_triplet
+                    )
 
         elif verb == "grasp":
             if phase == "CLOSE_GRIPPER":

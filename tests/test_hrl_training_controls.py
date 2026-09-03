@@ -32,12 +32,36 @@ sys.modules.setdefault("m_dVrk", m_dvrk_package)
 hrl_package = types.ModuleType("m_dVrk.hrl")
 hrl_package.__path__ = [str(PACKAGE_ROOT / "hrl")]
 sys.modules.setdefault("m_dVrk.hrl", hrl_package)
+controllers_package = types.ModuleType("m_dVrk.controllers")
+controllers_package.__path__ = [str(PACKAGE_ROOT / "controllers")]
+sys.modules.setdefault("m_dVrk.controllers", controllers_package)
+
+# The state-machine timeout test exercises pure transition logic and does not
+# require Isaac Sim. Stub its import-only dependencies during this unit test.
+isaaclab_package = types.ModuleType("isaaclab")
+isaaclab_utils_package = types.ModuleType("isaaclab.utils")
+isaaclab_math_module = types.ModuleType("isaaclab.utils.math")
+isaaclab_utils_package.math = isaaclab_math_module
+isaaclab_package.utils = isaaclab_utils_package
+sys.modules.setdefault("isaaclab", isaaclab_package)
+sys.modules.setdefault("isaaclab.utils", isaaclab_utils_package)
+sys.modules.setdefault("isaaclab.utils.math", isaaclab_math_module)
+
+ring_sync_module = types.ModuleType("m_dVrk.controllers.ring_sync")
+ring_sync_module.get_scene_entity_positions_w = lambda *args, **kwargs: None
+ring_sync_module.get_scene_entity_position_w = lambda *args, **kwargs: None
+ring_sync_module._get_scene_entity_position_w = lambda *args, **kwargs: None
+sys.modules.setdefault("m_dVrk.controllers.ring_sync", ring_sync_module)
 
 constants = load_module("m_dVrk.hrl.constants", PACKAGE_ROOT / "hrl" / "constants.py")
 schedules = load_module("m_dVrk.hrl.schedules", PACKAGE_ROOT / "hrl" / "schedules.py")
 masked_policy = load_module("m_dVrk.hrl.masked_policy", PACKAGE_ROOT / "hrl" / "masked_policy.py")
 checkpoints = load_module("m_dVrk.hrl.checkpoints", PACKAGE_ROOT / "hrl" / "checkpoints.py")
 rewards = load_module("m_dVrk.hrl.rewards", PACKAGE_ROOT / "hrl" / "rewards.py")
+state_machine = load_module(
+    "m_dVrk.controllers.spartan_state_machine",
+    PACKAGE_ROOT / "controllers" / "spartan_state_machine.py",
+)
 
 
 def put_action_one_hot(obs: torch.Tensor, offset: int, action: list[int]) -> None:
@@ -57,6 +81,16 @@ def base_observation(batch_size: int = 1) -> torch.Tensor:
     ]
     put_action_one_hot(obs, 96, idle)
     put_action_one_hot(obs, 124, idle)
+    ring_positions = torch.tensor(
+        [
+            [0.335, -0.055, 0.717],
+            [0.362, -0.055, 0.717],
+            [0.388, -0.055, 0.717],
+            [0.415, -0.055, 0.717],
+        ],
+        dtype=torch.float32,
+    )
+    obs[:, 164:176] = ring_positions.flatten()
     obs[:, 240:244] = 1
     return obs
 
@@ -131,6 +165,74 @@ class RewardTests(unittest.TestCase):
         self.assertEqual(result.item(), 99.0)
 
 
+class StateMachineTimeoutTests(unittest.TestCase):
+    def test_reach_timeout_recovers_then_returns_idle(self) -> None:
+        machine = state_machine.SPARTANStateMachine.__new__(
+            state_machine.SPARTANStateMachine
+        )
+        machine.device = torch.device("cpu")
+        machine.debug_mode = False
+        machine._get_reach_entry_position = lambda subject, env_id: torch.ones(3)
+        machine.get_target_coordinates = lambda target, subject, env_id: torch.ones(3)
+        machine._tip_reached = lambda tip, dest: False
+        machine._get_fixed_speed_cmd = lambda tip, dest: dest - tip
+
+        active = ["reach"]
+        sub_state = ["DESCEND"]
+        step_counter = [machine.REACH_PHASE_TIMEOUT_STEPS]
+        current = [{"verb": "reach", "subject": "left_arm", "target": "ring_red"}]
+        last_target = [None]
+        attached_target = [None]
+        target_pos = torch.zeros((1, 3))
+        gripper_state = torch.ones(1)
+        release_target = [None]
+        release_committed = [False]
+        tip = torch.zeros((1, 3))
+        act = torch.zeros((1, 7))
+        grip = torch.ones((1, 2))
+
+        machine._process_arm_logic(
+            0,
+            active,
+            sub_state,
+            step_counter,
+            current,
+            last_target,
+            attached_target,
+            target_pos,
+            gripper_state,
+            release_target,
+            release_committed,
+            tip,
+            act,
+            grip,
+            "left_arm",
+        )
+        self.assertEqual(sub_state[0], "RECOVER_TO_ENTRY")
+        self.assertIsNotNone(current[0])
+
+        step_counter[0] = machine.REACH_RECOVERY_TIMEOUT_STEPS
+        machine._process_arm_logic(
+            0,
+            active,
+            sub_state,
+            step_counter,
+            current,
+            last_target,
+            attached_target,
+            target_pos,
+            gripper_state,
+            release_target,
+            release_committed,
+            tip,
+            act,
+            grip,
+            "left_arm",
+        )
+        self.assertEqual(sub_state[0], "IDLE")
+        self.assertIsNone(current[0])
+
+
 class ActionMaskTests(unittest.TestCase):
     def setUp(self) -> None:
         axes = [torch.arange(dim) for dim in (4, 10, 4, 10)]
@@ -187,6 +289,19 @@ class ActionMaskTests(unittest.TestCase):
         mask = self.mask(obs)
         self.assertTrue(mask[0, action_index([reach, red, idle, none])])
         self.assertFalse(mask[0, action_index([reach, blue, idle, none])])
+
+    def test_opposite_corner_ring_is_masked_per_arm(self) -> None:
+        obs = base_observation()
+        # Far upper-left corner: reachable from the right robot root but not
+        # from the left robot root at x=0.50.
+        obs[:, 164:167] = torch.tensor([0.318, 0.007, 0.717])
+        mask = self.mask(obs)
+        reach = constants.VERB_TO_ID["reach"]
+        idle = constants.VERB_TO_ID["idle"]
+        red = constants.TARGET_TO_ID["ring_red"]
+        none = constants.TARGET_TO_ID["None"]
+        self.assertFalse(mask[0, action_index([reach, red, idle, none])])
+        self.assertTrue(mask[0, action_index([idle, none, reach, red])])
 
     def test_masked_policy_keeps_standard_parameter_layout(self) -> None:
         observation_space = spaces.Box(-np.inf, np.inf, (244,), dtype=np.float32)

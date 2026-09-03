@@ -449,6 +449,23 @@ class DVRKVisionHRLWrapper(VecEnv):
         isaac_done    = terminated_il | truncated_il
         active_env_mask = ~isaac_done
 
+        # A timed-out reach returns to IDLE without setting last_target. Do not
+        # expose that failed command as the previous successful reach, otherwise
+        # the observation-derived mask could incorrectly enable a grasp.
+        for i in range(self.num_envs):
+            if self.sm.sub_state_l[i] == "IDLE":
+                verb_l = VERB_MAP[int(self.prev_actions[i, 0].item())]
+                target_l = TARGET_MAP[int(self.prev_actions[i, 1].item())]
+                if verb_l == "reach" and self.sm.last_target_l[i] != target_l:
+                    self.prev_actions[i, 0] = VERB_TO_ID["idle"]
+                    self.prev_actions[i, 1] = TARGET_TO_ID["None"]
+            if self.sm.sub_state_r[i] == "IDLE":
+                verb_r = VERB_MAP[int(self.prev_actions[i, 2].item())]
+                target_r = TARGET_MAP[int(self.prev_actions[i, 3].item())]
+                if verb_r == "reach" and self.sm.last_target_r[i] != target_r:
+                    self.prev_actions[i, 2] = VERB_TO_ID["idle"]
+                    self.prev_actions[i, 3] = TARGET_TO_ID["None"]
+
         tip_r = robot_r.data.body_pos_w[:, self._tip_idx_r]
         tip_l = robot_l.data.body_pos_w[:, self._tip_idx_l]
 
