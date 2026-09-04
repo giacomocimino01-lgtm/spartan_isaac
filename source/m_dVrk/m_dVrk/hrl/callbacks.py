@@ -13,7 +13,10 @@ from collections import deque
 
 from stable_baselines3.common.callbacks import BaseCallback
 
-from m_dVrk.hrl.curriculum import RingRandomizationCurriculum
+from m_dVrk.hrl.curriculum import (
+    AdaptiveRingRandomizationCurriculum,
+    RingRandomizationCurriculum,
+)
 from m_dVrk.hrl.schedules import CosineDecaySchedule
 
 
@@ -308,4 +311,83 @@ class RingRandomizationCurriculumCallback(BaseCallback):
 
     def _on_step(self) -> bool:
         self._set_scale()
+        return True
+
+
+class AdaptiveRingRandomizationCurriculumCallback(BaseCallback):
+    """Advance ring difficulty from task-success windows, not wall-clock time."""
+
+    def __init__(
+        self,
+        raw_env: object,
+        curriculum: AdaptiveRingRandomizationCurriculum,
+        min_advance_timesteps: int = 0,
+        verbose: int = 0,
+    ) -> None:
+        super().__init__(verbose)
+        self.raw_env = raw_env
+        self.curriculum = curriculum
+        self.min_advance_timesteps = max(0, int(min_advance_timesteps))
+
+    def _record_state(self) -> None:
+        self.logger.record(
+            "curriculum/ring_randomization_scale",
+            self.curriculum.current_scale,
+        )
+        rate = self.curriculum.recent_success_rate
+        if rate is not None:
+            self.logger.record("curriculum/recent_success_rate", rate)
+        self.logger.record(
+            "curriculum/recent_episode_count",
+            self.curriculum.recent_episode_count,
+        )
+
+    def _on_training_start(self) -> None:
+        setattr(
+            self.raw_env,
+            "ring_randomization_scale",
+            self.curriculum.current_scale,
+        )
+        self._record_state()
+        if self.verbose > 0:
+            print(
+                "[PPO] Adaptive ring curriculum: "
+                f"start_scale={self.curriculum.current_scale:.4f} "
+                f"step={self.curriculum.scale_step:.4f} "
+                f"threshold={self.curriculum.success_threshold:.2%} "
+                f"window={self.curriculum.window_episodes} "
+                f"advance_after={self.min_advance_timesteps}",
+                flush=True,
+            )
+
+    def _on_step(self) -> bool:
+        outcomes: list[tuple[float, bool]] = []
+        for info in self.locals.get("infos") or []:
+            if info.get("episode") is None:
+                continue
+            episode_scale = info.get("ring_randomization_scale")
+            if episode_scale is None:
+                continue
+            outcomes.append((float(episode_scale), bool(info.get("is_success", False))))
+
+        old_scale = self.curriculum.current_scale
+        advanced = self.curriculum.observe(
+            outcomes,
+            allow_advance=self.num_timesteps >= self.min_advance_timesteps,
+        )
+        if advanced:
+            setattr(
+                self.raw_env,
+                "ring_randomization_scale",
+                self.curriculum.current_scale,
+            )
+            if self.verbose > 0:
+                print(
+                    "[PPO] Adaptive ring curriculum advanced: "
+                    f"timestep={self.num_timesteps} "
+                    f"scale={old_scale:.4f}->{self.curriculum.current_scale:.4f}",
+                    flush=True,
+                )
+
+        self._record_state()
         return True

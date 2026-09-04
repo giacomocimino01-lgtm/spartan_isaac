@@ -58,6 +58,38 @@ parser.add_argument(
     help="Training fraction at which the full ring randomization area is reached.",
 )
 parser.add_argument(
+    "--adaptive_ring_curriculum",
+    action="store_true",
+    help=(
+        "Advance ring randomization only after a rolling task-success target is met. "
+        "Mutually exclusive with static and time-based ring randomization."
+    ),
+)
+parser.add_argument(
+    "--adaptive_ring_start_scale",
+    type=float,
+    default=0.75,
+    help="Initial workspace randomization scale for adaptive fine-tuning.",
+)
+parser.add_argument(
+    "--adaptive_ring_scale_step",
+    type=float,
+    default=0.05,
+    help="Randomization-scale increment after each successful adaptive stage.",
+)
+parser.add_argument(
+    "--adaptive_ring_success_threshold",
+    type=float,
+    default=0.85,
+    help="Rolling success rate required to advance adaptive difficulty.",
+)
+parser.add_argument(
+    "--adaptive_ring_window_episodes",
+    type=int,
+    default=512,
+    help="Number of same-scale completed episodes in the adaptive success window.",
+)
+parser.add_argument(
     "--pretrained_checkpoint",
     type=str,
     default=None,
@@ -196,6 +228,7 @@ from m_dVrk.hrl.constants import (
 from m_dVrk.hrl.tcc import XIRLResnet18, load_tcc_model
 from m_dVrk.hrl.wrapper import DVRKVisionHRLWrapper
 from m_dVrk.hrl.callbacks import (
+    AdaptiveRingRandomizationCurriculumCallback,
     EpisodeCsvLoggerCallback,
     BestTerminalDistanceCheckpointCallback,
     FreezePolicyCallback,
@@ -207,7 +240,10 @@ from m_dVrk.hrl.masked_policy import (
     masked_policy_custom_objects,
 )
 from m_dVrk.hrl.schedules import CosineDecaySchedule, LowHighCosineSchedule
-from m_dVrk.hrl.curriculum import RingRandomizationCurriculum
+from m_dVrk.hrl.curriculum import (
+    AdaptiveRingRandomizationCurriculum,
+    RingRandomizationCurriculum,
+)
 from m_dVrk.controllers.spartan_state_machine import SPARTANStateMachine
 
 # (All constants are now imported from m_dVrk.hrl.constants above)
@@ -279,8 +315,19 @@ def main_train():
         raise ValueError("--lr_decay_start_fraction must be in [0, 1]")
     if not 0.0 <= args_cli.ent_decay_start_fraction <= 1.0:
         raise ValueError("--ent_decay_start_fraction must be in [0, 1]")
-    if args_cli.ring_curriculum and args_cli.randomize_rings:
-        raise ValueError("--ring_curriculum and --randomize_rings are mutually exclusive")
+    ring_reset_modes = sum(
+        bool(value)
+        for value in (
+            args_cli.randomize_rings,
+            args_cli.ring_curriculum,
+            args_cli.adaptive_ring_curriculum,
+        )
+    )
+    if ring_reset_modes > 1:
+        raise ValueError(
+            "--randomize_rings, --ring_curriculum, and "
+            "--adaptive_ring_curriculum are mutually exclusive"
+        )
     if args_cli.ring_curriculum and not (
         0.0
         <= args_cli.ring_curriculum_start_fraction
@@ -297,6 +344,7 @@ def main_train():
             "the mask reads the categorical state fields from the raw 244-D observation."
         )
     ring_curriculum_schedule = None
+    adaptive_ring_curriculum = None
     if args_cli.ring_curriculum:
         ring_curriculum_schedule = RingRandomizationCurriculum(
             total_timesteps=args_cli.total_timesteps,
@@ -307,6 +355,13 @@ def main_train():
                 args_cli.total_timesteps * args_cli.ring_curriculum_full_fraction
             ),
         )
+    elif args_cli.adaptive_ring_curriculum:
+        adaptive_ring_curriculum = AdaptiveRingRandomizationCurriculum(
+            start_scale=args_cli.adaptive_ring_start_scale,
+            scale_step=args_cli.adaptive_ring_scale_step,
+            success_threshold=args_cli.adaptive_ring_success_threshold,
+            window_episodes=args_cli.adaptive_ring_window_episodes,
+        )
 
     env_cfg = MDvrkEnvCfg()
     env_cfg.scene.num_envs = args_cli.num_envs
@@ -315,17 +370,31 @@ def main_train():
     env_cfg.wait_for_textures = False
     env_cfg.seed = 42
     env_cfg.events.reset_rings.params["randomize"] = bool(
-        args_cli.randomize_rings or args_cli.ring_curriculum
+        args_cli.randomize_rings
+        or args_cli.ring_curriculum
+        or args_cli.adaptive_ring_curriculum
     )
     initial_ring_randomization_scale = (
         ring_curriculum_schedule.value_at(0)
         if ring_curriculum_schedule is not None
-        else float(args_cli.randomize_rings)
+        else (
+            adaptive_ring_curriculum.current_scale
+            if adaptive_ring_curriculum is not None
+            else float(args_cli.randomize_rings)
+        )
     )
     env_cfg.events.reset_rings.params["randomization_scale"] = (
         initial_ring_randomization_scale
     )
-    if ring_curriculum_schedule is not None:
+    if adaptive_ring_curriculum is not None:
+        print(
+            "[INFO] Ring reset mode: adaptive curriculum "
+            f"(start={adaptive_ring_curriculum.current_scale:.4f}, "
+            f"step={adaptive_ring_curriculum.scale_step:.4f}, "
+            f"threshold={adaptive_ring_curriculum.success_threshold:.2%}, "
+            f"window={adaptive_ring_curriculum.window_episodes})"
+        )
+    elif ring_curriculum_schedule is not None:
         print(
             "[INFO] Ring reset mode: curriculum "
             f"(fixed through {ring_curriculum_schedule.start_timesteps}, "
@@ -513,6 +582,15 @@ def main_train():
             RingRandomizationCurriculumCallback(
                 raw_env=isaac_env,
                 schedule=ring_curriculum_schedule,
+                verbose=1,
+            )
+        )
+    if adaptive_ring_curriculum is not None:
+        callbacks_list.append(
+            AdaptiveRingRandomizationCurriculumCallback(
+                raw_env=isaac_env,
+                curriculum=adaptive_ring_curriculum,
+                min_advance_timesteps=freeze_timesteps,
                 verbose=1,
             )
         )

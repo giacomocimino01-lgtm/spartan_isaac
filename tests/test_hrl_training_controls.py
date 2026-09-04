@@ -159,6 +159,56 @@ class ScheduleTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             curriculum.RingRandomizationCurriculum(100, 80, 80)
 
+    def test_adaptive_curriculum_advances_after_success_window(self) -> None:
+        adaptive = curriculum.AdaptiveRingRandomizationCurriculum(
+            start_scale=0.75,
+            scale_step=0.05,
+            success_threshold=0.75,
+            window_episodes=4,
+        )
+        advanced = adaptive.observe(
+            [(0.75, True), (0.75, True), (0.75, True), (0.75, False)]
+        )
+        self.assertTrue(advanced)
+        self.assertAlmostEqual(adaptive.current_scale, 0.80)
+        self.assertEqual(adaptive.recent_episode_count, 0)
+
+    def test_adaptive_curriculum_holds_below_threshold(self) -> None:
+        adaptive = curriculum.AdaptiveRingRandomizationCurriculum(
+            success_threshold=0.75,
+            window_episodes=4,
+        )
+        advanced = adaptive.observe(
+            [(0.75, True), (0.75, False), (0.75, False), (0.75, True)]
+        )
+        self.assertFalse(advanced)
+        self.assertEqual(adaptive.current_scale, 0.75)
+        self.assertAlmostEqual(adaptive.recent_success_rate, 0.5)
+
+    def test_adaptive_curriculum_ignores_inflight_old_scale(self) -> None:
+        adaptive = curriculum.AdaptiveRingRandomizationCurriculum(
+            start_scale=0.75,
+            scale_step=0.05,
+            success_threshold=1.0,
+            window_episodes=2,
+        )
+        self.assertTrue(adaptive.observe([(0.75, True), (0.75, True)]))
+        self.assertAlmostEqual(adaptive.current_scale, 0.80)
+        self.assertFalse(adaptive.observe([(0.75, True), (0.75, True)]))
+        self.assertEqual(adaptive.recent_episode_count, 0)
+
+    def test_adaptive_curriculum_respects_advance_hold(self) -> None:
+        adaptive = curriculum.AdaptiveRingRandomizationCurriculum(
+            success_threshold=1.0,
+            window_episodes=2,
+        )
+        self.assertFalse(
+            adaptive.observe(
+                [(0.75, True), (0.75, True)], allow_advance=False
+            )
+        )
+        self.assertTrue(adaptive.observe([], allow_advance=True))
+
 
 class CheckpointTests(unittest.TestCase):
     def test_step_checkpoint_vecnormalize_name(self) -> None:
