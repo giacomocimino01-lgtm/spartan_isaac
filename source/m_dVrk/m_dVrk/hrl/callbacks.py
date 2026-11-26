@@ -14,6 +14,8 @@ from collections import deque
 from stable_baselines3.common.callbacks import BaseCallback
 
 from m_dVrk.hrl.curriculum import (
+    AdaptiveMinimalMaskCurriculum,
+    AdaptivePhaseEntryPoseCurriculum,
     AdaptiveRingRandomizationCurriculum,
     RingRandomizationCurriculum,
 )
@@ -47,16 +49,27 @@ class EpisodeCsvLoggerCallback(BaseCallback):
                 "total_timesteps",
                 "env_id",
                 "episode_reward",
+                "discounted_episode_return",
                 "episode_length",
                 "episode_time_seconds",
                 "is_success",
                 "rings_complete",
+                "invalid_commands",
+                "bimanual_steps",
+                "left_active_steps",
+                "right_active_steps",
+                "joint_action_changes",
+                "free_arm_step_slots",
                 "terminal_distance",
                 "green_peg_ring_count",
                 "red_peg_ring_count",
+                "yellow_peg_ring_count",
                 "blue_peg_ring_count",
+                "board_center_ring_count",
                 "time_limit_truncated",
                 "ring_randomization_scale",
+                "phase_entry_pose_scale",
+                "phase_entry_pose_sampled_scale",
             ],
         )
         self._writer.writeheader()
@@ -79,17 +92,48 @@ class EpisodeCsvLoggerCallback(BaseCallback):
                     "total_timesteps": int(self.num_timesteps),
                     "env_id": env_id,
                     "episode_reward": float(episode.get("r", 0.0)),
+                    "discounted_episode_return": float(
+                        info.get("discounted_episode_return", float("nan"))
+                    ),
                     "episode_length": int(episode.get("l", 0)),
                     "episode_time_seconds": float(episode.get("t", 0.0)),
                     "is_success": bool(info.get("is_success", False)),
                     "rings_complete": bool(info.get("rings_complete", False)),
+                    "invalid_commands": int(
+                        info.get("episode_invalid_commands", 0)
+                    ),
+                    "bimanual_steps": int(info.get("episode_bimanual_steps", 0)),
+                    "left_active_steps": int(
+                        info.get("episode_left_active_steps", 0)
+                    ),
+                    "right_active_steps": int(
+                        info.get("episode_right_active_steps", 0)
+                    ),
+                    "joint_action_changes": int(
+                        info.get("episode_joint_action_changes", 0)
+                    ),
+                    "free_arm_step_slots": int(
+                        info.get("episode_free_arm_step_slots", 0)
+                    ),
                     "terminal_distance": float(info.get("terminal_distance", float("nan"))),
                     "green_peg_ring_count": int(info.get("green_peg_ring_count", 0)),
                     "red_peg_ring_count": int(info.get("red_peg_ring_count", 0)),
+                    "yellow_peg_ring_count": int(
+                        info.get("yellow_peg_ring_count", 0)
+                    ),
                     "blue_peg_ring_count": int(info.get("blue_peg_ring_count", 0)),
+                    "board_center_ring_count": int(
+                        info.get("board_center_ring_count", 0)
+                    ),
                     "time_limit_truncated": bool(info.get("TimeLimit.truncated", False)),
                     "ring_randomization_scale": float(
                         info.get("ring_randomization_scale", float("nan"))
+                    ),
+                    "phase_entry_pose_scale": float(
+                        info.get("phase_entry_pose_scale", float("nan"))
+                    ),
+                    "phase_entry_pose_sampled_scale": float(
+                        info.get("phase_entry_pose_sampled_scale", float("nan"))
                     ),
                 }
             )
@@ -277,6 +321,238 @@ class EntropyCoefficientScheduleCallback(BaseCallback):
         self._set_value()
         return True
 
+class SoftMaskPenaltyScheduleCallback(BaseCallback):
+    """Anneal the logit penalty applied to minimal-only joint actions.
+
+    The actions remain legal throughout training.  A positive penalty merely
+    lowers their sampling probability relative to actions also admitted by
+    the guided mask, avoiding an abrupt distribution shift when a pretrained
+    guided policy is loaded under the minimal mask.
+    """
+
+    def __init__(self, schedule: CosineDecaySchedule, verbose: int = 0) -> None:
+        super().__init__(verbose)
+        self.schedule = schedule
+        self._last_logged_bucket = -1
+
+    def _set_value(self) -> None:
+        value = self.schedule.value_at(self.num_timesteps)
+        setter = getattr(self.model.policy, "set_soft_mask_penalty", None)
+        if setter is None:
+            raise TypeError("Soft-mask schedule requires a masked policy")
+        setter(value)
+        self.model.policy_kwargs["soft_mask_penalty"] = value
+        self.logger.record("train/soft_mask_penalty", value)
+
+        bucket = int(10 * self.num_timesteps / max(1, self.schedule.total_timesteps))
+        if self.verbose > 0 and bucket != self._last_logged_bucket:
+            print(
+                f"[PPO] Soft-mask schedule: timestep={self.num_timesteps} "
+                f"logit_penalty={value:.6g}",
+                flush=True,
+            )
+            self._last_logged_bucket = bucket
+
+    def _on_training_start(self) -> None:
+        self._set_value()
+
+    def _on_step(self) -> bool:
+        self._set_value()
+        return True
+
+    def _on_rollout_start(self) -> None:
+        distribution = getattr(self.model.policy, "action_dist", None)
+        reset = getattr(distribution, "reset_soft_mask_diagnostics", None)
+        if reset is not None:
+            reset()
+
+    def _on_rollout_end(self) -> None:
+        distribution = getattr(self.model.policy, "action_dist", None)
+        diagnostics = getattr(distribution, "soft_mask_diagnostics", None)
+        if diagnostics is not None:
+            new_probability, logit_advantage = diagnostics()
+        else:
+            new_probability = getattr(distribution, "last_new_action_probability", None)
+            logit_advantage = getattr(
+                distribution, "last_new_action_logit_advantage", None
+            )
+        if new_probability is not None and new_probability.numel():
+            self.logger.record(
+                "train/soft_new_prob",
+                float(new_probability.float().mean().item()),
+            )
+            self.logger.record(
+                "train/soft_new_prob_max",
+                float(new_probability.float().max().item()),
+            )
+        if logit_advantage is not None and logit_advantage.numel():
+            self.logger.record(
+                "train/soft_logit_adv",
+                float(logit_advantage.float().mean().item()),
+            )
+            self.logger.record(
+                "train/soft_logit_adv_max",
+                float(logit_advantage.float().max().item()),
+            )
+
+
+class ManipulabilityObservationCurriculumCallback(BaseCallback):
+    """Gradually expose completed top rings as physically manipulable."""
+
+    def __init__(
+        self,
+        hrl_env: object,
+        schedule: RingRandomizationCurriculum,
+        verbose: int = 0,
+    ) -> None:
+        super().__init__(verbose)
+        self.hrl_env = hrl_env
+        self.schedule = schedule
+        self._last_logged_bucket = -1
+
+    def _set_value(self) -> None:
+        value = self.schedule.value_at(self.num_timesteps)
+        setter = getattr(self.hrl_env, "set_manipulability_curriculum_scale", None)
+        if setter is None:
+            raise TypeError("Manipulability curriculum requires DVRKVisionHRLWrapper")
+        setter(value)
+        self.logger.record("train/manipulability_scale", value)
+
+        bucket = int(10 * self.num_timesteps / max(1, self.schedule.total_timesteps))
+        if self.verbose > 0 and bucket != self._last_logged_bucket:
+            print(
+                f"[PPO] Manipulability observation curriculum: "
+                f"timestep={self.num_timesteps} scale={value:.4f}",
+                flush=True,
+            )
+            self._last_logged_bucket = bucket
+
+    def _on_training_start(self) -> None:
+        self._set_value()
+
+    def _on_step(self) -> bool:
+        self._set_value()
+        return True
+
+
+class AdaptiveMinimalMaskCurriculumCallback(BaseCallback):
+    """Advance observation semantics and soft masking from success windows."""
+
+    def __init__(
+        self,
+        hrl_env: object,
+        curriculum: AdaptiveMinimalMaskCurriculum,
+        min_advance_timesteps: int = 0,
+        verbose: int = 0,
+    ) -> None:
+        super().__init__(verbose)
+        self.hrl_env = hrl_env
+        self.curriculum = curriculum
+        self.min_advance_timesteps = max(0, int(min_advance_timesteps))
+
+    def _apply_state(self) -> None:
+        env_setter = getattr(
+            self.hrl_env, "set_manipulability_curriculum_scale", None
+        )
+        policy_setter = getattr(self.model.policy, "set_soft_mask_penalty", None)
+        if env_setter is None or policy_setter is None:
+            raise TypeError(
+                "Adaptive minimal-mask curriculum requires the HRL wrapper "
+                "and a masked policy"
+            )
+        env_setter(self.curriculum.current_scale)
+        policy_setter(self.curriculum.current_penalty)
+        self.model.policy_kwargs["soft_mask_penalty"] = (
+            self.curriculum.current_penalty
+        )
+
+    def _record_state(self) -> None:
+        self.logger.record(
+            "curriculum/manipulability_scale", self.curriculum.current_scale
+        )
+        self.logger.record(
+            "curriculum/soft_mask_penalty", self.curriculum.current_penalty
+        )
+        self.logger.record(
+            "curriculum/recent_episode_count",
+            self.curriculum.recent_episode_count,
+        )
+        rate = self.curriculum.recent_success_rate
+        if rate is not None:
+            self.logger.record("curriculum/recent_success_rate", rate)
+        self.logger.record(
+            "curriculum/minimal_complete", float(self.curriculum.complete)
+        )
+
+    def _on_training_start(self) -> None:
+        self._apply_state()
+        self._record_state()
+        if self.verbose > 0:
+            print(
+                "[PPO] Adaptive minimal-mask curriculum: "
+                f"scale={self.curriculum.current_scale:.3f} "
+                f"penalty={self.curriculum.current_penalty:.3f} "
+                f"scale_step={self.curriculum.scale_step:.3f} "
+                f"penalty_step={self.curriculum.penalty_step:.3f} "
+                f"threshold={self.curriculum.success_threshold:.2%} "
+                f"window={self.curriculum.window_episodes} "
+                f"cooldown={self.curriculum.cooldown_timesteps}",
+                flush=True,
+            )
+
+    def _on_rollout_start(self) -> None:
+        distribution = getattr(self.model.policy, "action_dist", None)
+        reset = getattr(distribution, "reset_soft_mask_diagnostics", None)
+        if reset is not None:
+            reset()
+
+    def _on_rollout_end(self) -> None:
+        distribution = getattr(self.model.policy, "action_dist", None)
+        diagnostics = getattr(distribution, "soft_mask_diagnostics", None)
+        if diagnostics is None:
+            return
+        probabilities, advantages = diagnostics()
+        if probabilities is not None and probabilities.numel():
+            self.logger.record(
+                "train/soft_new_prob", float(probabilities.float().mean().item())
+            )
+            self.logger.record(
+                "train/soft_new_prob_max", float(probabilities.float().max().item())
+            )
+        if advantages is not None and advantages.numel():
+            self.logger.record(
+                "train/soft_logit_adv", float(advantages.float().mean().item())
+            )
+            self.logger.record(
+                "train/soft_logit_adv_max", float(advantages.float().max().item())
+            )
+
+    def _on_step(self) -> bool:
+        successes = [
+            bool(info.get("is_success", False))
+            for info in (self.locals.get("infos") or [])
+            if info.get("episode") is not None
+        ]
+        transition = self.curriculum.observe(
+            successes,
+            timestep=self.num_timesteps,
+            allow_advance=self.num_timesteps >= self.min_advance_timesteps,
+        )
+        if transition is not None:
+            old_scale, old_penalty, new_scale, new_penalty = transition
+            self._apply_state()
+            if self.verbose > 0:
+                print(
+                    "[PPO] Adaptive minimal-mask curriculum advanced: "
+                    f"timestep={self.num_timesteps} "
+                    f"scale={old_scale:.3f}->{new_scale:.3f} "
+                    f"penalty={old_penalty:.3f}->{new_penalty:.3f} "
+                    f"complete={self.curriculum.complete}",
+                    flush=True,
+                )
+        self._record_state()
+        return True
+
 
 class RingRandomizationCurriculumCallback(BaseCallback):
     """Update the ring-reset randomization scale during PPO training."""
@@ -386,6 +662,85 @@ class AdaptiveRingRandomizationCurriculumCallback(BaseCallback):
                     "[PPO] Adaptive ring curriculum advanced: "
                     f"timestep={self.num_timesteps} "
                     f"scale={old_scale:.4f}->{self.curriculum.current_scale:.4f}",
+                    flush=True,
+                )
+
+        self._record_state()
+        return True
+
+
+class AdaptivePhaseEntryPoseCurriculumCallback(BaseCallback):
+    """Advance canonical-to-parked reset difficulty after successful windows."""
+
+    def __init__(
+        self,
+        raw_env: object,
+        curriculum: AdaptivePhaseEntryPoseCurriculum,
+        min_advance_timesteps: int = 0,
+        verbose: int = 0,
+    ) -> None:
+        super().__init__(verbose)
+        self.raw_env = raw_env
+        self.curriculum = curriculum
+        self.min_advance_timesteps = max(0, int(min_advance_timesteps))
+
+    def _record_state(self) -> None:
+        self.logger.record(
+            "curriculum/phase_entry_pose_scale",
+            self.curriculum.current_scale,
+        )
+        rate = self.curriculum.recent_success_rate
+        if rate is not None:
+            self.logger.record("curriculum/phase_entry_recent_success_rate", rate)
+        self.logger.record(
+            "curriculum/phase_entry_recent_episode_count",
+            self.curriculum.recent_episode_count,
+        )
+
+    def _on_training_start(self) -> None:
+        setattr(
+            self.raw_env,
+            "phase_entry_pose_scale",
+            self.curriculum.current_scale,
+        )
+        self._record_state()
+        if self.verbose > 0:
+            print(
+                "[PPO] Adaptive phase-entry pose curriculum: "
+                f"start_scale={self.curriculum.current_scale:.3f} "
+                f"step={self.curriculum.scale_step:.3f} "
+                f"threshold={self.curriculum.success_threshold:.2%} "
+                f"window={self.curriculum.window_episodes} "
+                f"advance_after={self.min_advance_timesteps}",
+                flush=True,
+            )
+
+    def _on_step(self) -> bool:
+        outcomes: list[tuple[float, bool]] = []
+        for info in self.locals.get("infos") or []:
+            if info.get("episode") is None:
+                continue
+            episode_scale = info.get("phase_entry_pose_scale")
+            if episode_scale is None:
+                continue
+            outcomes.append((float(episode_scale), bool(info.get("is_success", False))))
+
+        old_scale = self.curriculum.current_scale
+        advanced = self.curriculum.observe(
+            outcomes,
+            allow_advance=self.num_timesteps >= self.min_advance_timesteps,
+        )
+        if advanced:
+            setattr(
+                self.raw_env,
+                "phase_entry_pose_scale",
+                self.curriculum.current_scale,
+            )
+            if self.verbose > 0:
+                print(
+                    "[PPO] Adaptive phase-entry pose curriculum advanced: "
+                    f"timestep={self.num_timesteps} "
+                    f"scale={old_scale:.3f}->{self.curriculum.current_scale:.3f}",
                     flush=True,
                 )
 

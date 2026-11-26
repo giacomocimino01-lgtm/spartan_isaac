@@ -6,6 +6,7 @@ Usage:
     python evaluation/training_analysis.py --task_phase phase_1
 """
 import argparse
+import json
 import os
 import sys
 from datetime import datetime
@@ -21,7 +22,7 @@ parser = argparse.ArgumentParser(description="Generate training analysis report.
 parser.add_argument(
     "--task_phase",
     type=str,
-    choices=["phase_0", "phase_1"],
+    choices=["phase_0", "phase_1", "phase_2", "phase_3", "phase_4"],
     default=None,
     help="Task phase to analyse. If omitted, the most recent log folder is used.",
 )
@@ -93,6 +94,12 @@ if "phase_0" in log_dir_name:
     phase_label = "Phase 0"
 elif "phase_1" in log_dir_name:
     phase_label = "Phase 1"
+elif "phase_2" in log_dir_name:
+    phase_label = "Phase 2"
+elif "phase_3" in log_dir_name:
+    phase_label = "Phase 3"
+elif "phase_4" in log_dir_name:
+    phase_label = "Phase 4"
 else:
     phase_label = log_dir_name
 
@@ -106,6 +113,24 @@ df_clean = df[df["rollout/ep_rew_mean"].notna()].copy()
 df_clean["total_timesteps_m"] = df_clean["time/total_timesteps"] / 1e6
 df_clean["reward_per_step"] = df_clean["rollout/ep_rew_mean"] / df_clean["rollout/ep_len_mean"]
 
+# When available, use the per-episode export for outcome statistics.  The SB3
+# progress file contains rolling aggregates, so treating its rows as episodes
+# (or inferring timeout frequency from the rolling mean length) is misleading.
+episode_csv = os.path.join(log_dir, "episode_progress.csv")
+episode_df = pd.read_csv(episode_csv) if os.path.exists(episode_csv) else None
+if episode_df is not None and not episode_df.empty:
+    if "is_success" in episode_df.columns:
+        episode_df["is_success"] = (
+            episode_df["is_success"].astype(str).str.lower().isin(["true", "1", "yes"])
+        )
+    if "time_limit_truncated" in episode_df.columns:
+        episode_df["time_limit_truncated"] = (
+            episode_df["time_limit_truncated"]
+            .astype(str)
+            .str.lower()
+            .isin(["true", "1", "yes"])
+        )
+
 # ─── Dynamic summary ──────────────────────────────────────────────────────────
 
 rew_first   = df_clean["rollout/ep_rew_mean"].iloc[0]
@@ -114,10 +139,17 @@ rew_best    = df_clean["rollout/ep_rew_mean"].max()
 rew_mean    = df_clean["rollout/ep_rew_mean"].mean()
 rew_median  = df_clean["rollout/ep_rew_mean"].median()
 total_steps = df_clean["time/total_timesteps"].max()
-n_episodes  = len(df_clean)
-window      = min(10, n_episodes // 5)
+n_rollouts  = len(df_clean)
+window      = max(1, min(10, n_rollouts // 5))
 
 has_success = "rollout/success_rate" in df_clean.columns
+pose_curriculum_column = "curriculum/phase_entry_pose_scale"
+has_pose_curriculum = pose_curriculum_column in df_clean.columns
+final_pose_curriculum_scale = (
+    float(df_clean[pose_curriculum_column].dropna().iloc[-1])
+    if has_pose_curriculum and not df_clean[pose_curriculum_column].dropna().empty
+    else None
+)
 if has_success:
     final_success = df_clean["rollout/success_rate"].iloc[-1]
     best_success  = df_clean["rollout/success_rate"].max()
@@ -127,14 +159,39 @@ else:
 
 ep_len_last  = df_clean["rollout/ep_len_mean"].iloc[-1]
 time_limit   = 600
-pct_timeout  = (df_clean["rollout/ep_len_mean"] >= time_limit - 1).mean() * 100
+if episode_df is not None and "time_limit_truncated" in episode_df.columns:
+    outcome_window = min(100, len(episode_df))
+    first_outcomes = episode_df.iloc[:outcome_window]
+    final_outcomes = episode_df.iloc[-outcome_window:]
+    pct_timeout = final_outcomes["time_limit_truncated"].mean() * 100
+    episode_count = len(episode_df)
+    initial_episode_success = (
+        first_outcomes["is_success"].mean()
+        if "is_success" in episode_df.columns
+        else float("nan")
+    )
+    final_episode_success = (
+        final_outcomes["is_success"].mean()
+        if "is_success" in episode_df.columns
+        else float("nan")
+    )
+else:
+    outcome_window = 0
+    pct_timeout = (df_clean["rollout/ep_len_mean"] >= time_limit - 1).mean() * 100
+    episode_count = None
+    initial_episode_success = final_episode_success = float("nan")
 
 rew_improved = rew_last > rew_first  # less-negative = better
+relative_reward_change = abs(rew_last - rew_first) / max(abs(rew_first), 1e-9)
 
 # Build status lines dynamically
 status_lines = []
 
-if rew_improved:
+if relative_reward_change <= 0.05:
+    status_lines.append(
+        f"~ Reward remained stable within 5%  ({rew_first:.1f} → {rew_last:.1f})"
+    )
+elif rew_improved:
     delta = rew_last - rew_first
     status_lines.append(f"✓ Reward improved by {delta:+.1f}  ({rew_first:.1f} → {rew_last:.1f})")
 else:
@@ -156,26 +213,47 @@ else:
 
 # Recommendations
 recommendations = []
-if not rew_improved:
+if not rew_improved and relative_reward_change > 0.05 and (not has_success or final_success < 0.7):
     recommendations.append("• Reduce learning rate or check reward shaping")
 if has_success and final_success < 0.3:
     recommendations.append("• Verify state machine / task configuration")
 if has_success and best_success > final_success + 0.15:
     recommendations.append("• Possible overfitting — try early stopping or reduce entropy coef")
-if not recommendations:
+if has_success and final_success >= 0.7:
+    recommendations.append("• Rank best, final, and late checkpoints with held-out deterministic evaluation")
+elif not recommendations:
     recommendations.append("• Training looks healthy — consider a longer run or fine-tuning")
+
+episode_summary = ""
+if episode_count is not None:
+    episode_summary = (
+        f"Episodes recorded: {episode_count:,}\n"
+        f"First {outcome_window} success: {initial_episode_success*100:.1f}%\n"
+        f"Last {outcome_window} success:  {final_episode_success*100:.1f}%\n"
+        f"Last {outcome_window} timeouts: {pct_timeout:.1f}%\n"
+    )
+    if "phase_entry_pose_sampled_scale" in episode_df.columns:
+        valid_pose_scales = episode_df["phase_entry_pose_sampled_scale"].dropna()
+        if not valid_pose_scales.empty:
+            episode_summary += (
+                "Sampled pose scale: "
+                f"{valid_pose_scales.min():.3f}–{valid_pose_scales.max():.3f}\n"
+            )
+if final_pose_curriculum_scale is not None:
+    episode_summary += f"Final pose curriculum scale: {final_pose_curriculum_scale:.3f}\n"
 
 summary_text = (
     f"TRAINING SUMMARY — {phase_label.upper()}\n"
     f"{'─'*44}\n"
     + "\n".join(status_lines)
     + "\n\n"
-    f"Total steps:     {total_steps:,.0f}\n"
-    f"Episodes logged: {n_episodes}\n"
-    f"Best reward:     {rew_best:.2f}\n"
-    f"Mean reward:     {rew_mean:.2f}\n"
-    f"Avg episode len: {ep_len_last:.0f} steps\n"
-    f"\nRECOMMENDATIONS:\n"
+    + f"Total steps:     {total_steps:,.0f}\n"
+    + f"Rollouts logged: {n_rollouts}\n"
+    + episode_summary
+    + f"Best reward:     {rew_best:.2f}\n"
+    + f"Mean reward:     {rew_mean:.2f}\n"
+    + f"Avg episode len: {ep_len_last:.0f} steps\n"
+    + f"\nRECOMMENDATIONS:\n"
     + "\n".join(recommendations)
 )
 
@@ -228,6 +306,22 @@ ax3.set_xlabel("Total Timesteps (Millions)", fontsize=11)
 ax3.set_ylabel("Success Rate", fontsize=11)
 ax3.set_title(f"[{phase_label}] Success Rate Trend", fontsize=12, fontweight="bold")
 ax3.grid(True, alpha=0.3)
+if has_pose_curriculum:
+    pose_rows = df_clean[["total_timesteps_m", pose_curriculum_column]].dropna()
+    if not pose_rows.empty:
+        ax3_pose = ax3.twinx()
+        ax3_pose.step(
+            pose_rows["total_timesteps_m"],
+            pose_rows[pose_curriculum_column],
+            where="post",
+            color="darkorange",
+            linewidth=2,
+            alpha=0.8,
+            label="Pose curriculum scale",
+        )
+        ax3_pose.set_ylim([-0.05, 1.05])
+        ax3_pose.set_ylabel("Pose curriculum scale", color="darkorange")
+        ax3_pose.tick_params(axis="y", colors="darkorange")
 
 # 4) Reward distribution
 ax4 = fig.add_subplot(gs[2, 0])
@@ -271,6 +365,33 @@ out_report = os.path.join(ARTIFACTS_DIR, "reports", log_dir_name, "training_anal
 os.makedirs(os.path.dirname(out_report), exist_ok=True)
 plt.savefig(out_report, dpi=150, bbox_inches="tight")
 print(f"✓ Report saved to: {out_report}")
+
+summary_payload = {
+    "generated_at": datetime.now().isoformat(timespec="seconds"),
+    "phase": phase_label,
+    "log_dir": log_dir,
+    "total_timesteps": int(total_steps),
+    "rollouts_logged": int(n_rollouts),
+    "episodes_recorded": int(episode_count) if episode_count is not None else None,
+    "first_window_success_rate": (
+        float(initial_episode_success) if not np.isnan(initial_episode_success) else None
+    ),
+    "final_window_success_rate": (
+        float(final_episode_success) if not np.isnan(final_episode_success) else None
+    ),
+    "final_window_timeout_rate": float(pct_timeout / 100),
+    "final_training_success_rate": float(final_success) if has_success else None,
+    "best_training_success_rate": float(best_success) if has_success else None,
+    "first_reward": float(rew_first),
+    "final_reward": float(rew_last),
+    "best_reward": float(rew_best),
+    "final_mean_episode_length": float(ep_len_last),
+    "final_phase_entry_pose_scale": final_pose_curriculum_scale,
+}
+summary_path = os.path.join(os.path.dirname(out_report), "report_summary.json")
+with open(summary_path, "w", encoding="utf-8") as stream:
+    json.dump(summary_payload, stream, indent=2)
+print(f"✓ Summary saved to: {summary_path}")
 
 # ─── CLI summary ──────────────────────────────────────────────────────────────
 

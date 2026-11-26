@@ -62,6 +62,16 @@ parser.add_argument(
     default="random",
     help="Arm selection for each ring.",
 )
+parser.add_argument(
+    "--phase2_arm_assignment",
+    choices=("same_side", "reverse", "left_only"),
+    default="same_side",
+    help=(
+        "Scripted phase-2 source-to-arm assignment. 'same_side' uses "
+        "red->left and blue->right; 'reverse' swaps the two arms; "
+        "'left_only' assigns both stacks to the left arm."
+    ),
+)
 parser.add_argument("--target_peg", type=str, default=PEG_GREEN, help="Peg where rings are placed.")
 parser.add_argument(
     "--num_rings",
@@ -73,6 +83,32 @@ parser.add_argument(
 parser.add_argument("--camera_width", type=int, default=0, help="Override camera width. 0 keeps env default.")
 parser.add_argument("--camera_height", type=int, default=0, help="Override camera height. 0 keeps env default.")
 parser.add_argument("--keep_failed", action="store_true", help="Keep failed videos under failed_<video_id> folders.")
+parser.add_argument(
+    "--initial_rerenders",
+    type=int,
+    default=4,
+    help=(
+        "Number of camera renders after applying a phase-specific initial "
+        "state. Multiple renders are required to flush stale RTX sensor data."
+    ),
+)
+parser.add_argument(
+    "--start_frames_only",
+    action="store_true",
+    help=(
+        "Save one fully rendered initial frame per episode and skip the "
+        "scripted trajectory. Useful for phase-router prototypes."
+    ),
+)
+parser.add_argument(
+    "--start_settle_steps",
+    type=int,
+    default=3,
+    help=(
+        "Idle simulation steps before a start-only capture. This clears the "
+        "renderer temporal history without advancing the scripted task."
+    ),
+)
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
@@ -97,7 +133,19 @@ import torchvision.io as io
 
 from isaaclab.envs import ManagerBasedRLEnv
 from m_dVrk.tasks.manager_based.m_dvrk.m_dvrk_env_cfg import MDvrkEnvCfg
-from m_dVrk.hrl.constants import RING_NAMES, PEG_GREEN, PEG_RED, PEG_BLUE
+from m_dVrk.hrl.constants import (
+    ARM_ROOT_XY,
+    BOARD_CENTER,
+    OUTSIDE_LEFT,
+    OUTSIDE_RIGHT,
+    MAX_RING_PLANAR_REACH,
+    RING_NAMES,
+    PEG_NAMES,
+    PEG_GREEN,
+    PEG_RED,
+    PEG_YELLOW,
+    PEG_BLUE,
+)
 from m_dVrk.controllers.spartan_state_machine import SPARTANStateMachine
 from m_dVrk.controllers.ring_sync import sync_attached_and_frozen_rings
 
@@ -136,6 +184,83 @@ def choose_arm(mode: str, ring_idx: int) -> str:
     return random.choice(["right_arm", "left_arm"])
 
 
+def choose_reachable_arm(sm, env_id: int, ring_name: str, mode: str, ring_idx: int) -> str:
+    """Choose an expert arm that can reach the ring's current stack."""
+    ring_xy_local = (
+        sm.frozen_rings_pose[ring_name][env_id, :2]
+        - sm.env.scene.env_origins[env_id, :2]
+    )
+    distances = {
+        arm: torch.linalg.vector_norm(
+            ring_xy_local - torch.tensor(root_xy, device=sm.device)
+        ).item()
+        for arm, root_xy in ARM_ROOT_XY.items()
+    }
+    reachable = [
+        arm for arm, distance in distances.items()
+        if distance <= MAX_RING_PLANAR_REACH
+    ]
+    preferred = choose_arm(mode, ring_idx)
+    if preferred in reachable:
+        return preferred
+    if reachable:
+        return random.choice(reachable)
+    return min(distances, key=distances.get)
+
+
+def choose_phase2_arm(sm, env_id: int, ring_name: str, assignment: str) -> str:
+    """Choose the scripted PSM for a phase-2 source stack."""
+    if assignment == "left_only":
+        return "left_arm"
+    source = sm.ring_support_peg[ring_name][env_id]
+    if source == PEG_RED:
+        same_side_arm = "left_arm"
+    elif source == PEG_BLUE:
+        same_side_arm = "right_arm"
+    else:
+        raise RuntimeError(f"phase_2 ring {ring_name} has invalid source {source!r}")
+    if assignment == "reverse":
+        return "right_arm" if same_side_arm == "left_arm" else "left_arm"
+    return same_side_arm
+
+
+def choose_phase3_arm(
+    sm,
+    env_id: int,
+    ring_name: str,
+    destination: str,
+    mode: str,
+    ring_idx: int,
+) -> str:
+    """Choose an arm that can reach both the centre source and goal peg."""
+    # Physical feasibility measured in the Phase-3 smoke test: the right PSM
+    # times out on centre->red, whereas the left PSM reaches all four pegs.
+    if destination == PEG_RED:
+        return "left_arm"
+    origin_xy = sm.env.scene.env_origins[env_id, :2]
+    ring_xy = sm.frozen_rings_pose[ring_name][env_id, :2] - origin_xy
+    distances: dict[str, float] = {}
+    feasible: list[str] = []
+    for arm, root_xy in ARM_ROOT_XY.items():
+        destination_xy = (
+            sm.get_target_coordinates(destination, arm, env_id)[:2] - origin_xy
+        )
+        root = torch.tensor(root_xy, device=sm.device)
+        worst_distance = max(
+            torch.linalg.vector_norm(ring_xy - root).item(),
+            torch.linalg.vector_norm(destination_xy - root).item(),
+        )
+        distances[arm] = worst_distance
+        if worst_distance <= MAX_RING_PLANAR_REACH:
+            feasible.append(arm)
+    preferred = choose_arm(mode, ring_idx)
+    if preferred in feasible:
+        return preferred
+    if feasible:
+        return random.choice(feasible)
+    return min(distances, key=distances.get)
+
+
 def build_commands_for_env(sm, env_id: int, class_name: str, ring_order: str, arm_mode: str, target_peg: str, num_rings: int = 4) -> tuple[list[tuple[str, str, str]], list[str]]:
     if class_name == "phase_1":
         rings = sm.get_top_rings_on_peg(env_id, PEG_GREEN, num_rings=4)
@@ -144,7 +269,9 @@ def build_commands_for_env(sm, env_id: int, class_name: str, ring_order: str, ar
         
         commands: list[tuple[str, str, str]] = []
         for ring_idx, ring_name in enumerate(rings):
-            arm = choose_arm(arm_mode, ring_idx)
+            arm = choose_reachable_arm(
+                sm, env_id, ring_name, arm_mode, ring_idx
+            )
             dest_peg = dest_pegs[ring_idx]
             commands.extend(
                 [
@@ -152,6 +279,88 @@ def build_commands_for_env(sm, env_id: int, class_name: str, ring_order: str, ar
                     ("grasp", arm, ring_name),
                     ("reach", arm, dest_peg),
                     ("release", arm, dest_peg),
+                ]
+            )
+        return commands, rings
+    elif class_name == "phase_2":
+        # Each source stack must be consumed top-first. Randomly interleave the
+        # red and blue stacks to retain trajectory variety without generating
+        # physically impossible attempts to grasp a covered ring.
+        source_stacks = [
+            sm.get_top_rings_on_peg(env_id, PEG_RED, num_rings=2),
+            sm.get_top_rings_on_peg(env_id, PEG_BLUE, num_rings=2),
+        ]
+        rings: list[str] = []
+        while any(source_stacks):
+            available = [idx for idx, stack in enumerate(source_stacks) if stack]
+            source_idx = random.choice(available)
+            rings.append(source_stacks[source_idx].pop(0))
+
+        commands = []
+        for ring_idx, ring_name in enumerate(rings):
+            arm = choose_phase2_arm(
+                sm, env_id, ring_name, args_cli.phase2_arm_assignment
+            )
+            commands.extend(
+                [
+                    ("reach", arm, ring_name),
+                    ("grasp", arm, ring_name),
+                    ("reach", arm, BOARD_CENTER),
+                    ("release", arm, BOARD_CENTER),
+                ]
+            )
+        return commands, rings
+    elif class_name == "phase_3":
+        # The centre is a stack: consume it top-first, but randomise the
+        # one-to-one ring-to-coloured-peg permutation across demonstrations.
+        rings = sm.get_top_rings_on_peg(env_id, BOARD_CENTER, num_rings=4)
+        dest_pegs = list(PEG_NAMES)
+        if ring_order == "random":
+            random.shuffle(dest_pegs)
+
+        commands = []
+        for ring_idx, (ring_name, dest_peg) in enumerate(zip(rings, dest_pegs)):
+            arm = choose_phase3_arm(
+                sm, env_id, ring_name, dest_peg, arm_mode, ring_idx
+            )
+            commands.extend(
+                [
+                    ("reach", arm, ring_name),
+                    ("grasp", arm, ring_name),
+                    ("reach", arm, dest_peg),
+                    ("release", arm, dest_peg),
+                ]
+            )
+        return commands, rings
+    elif class_name == "phase_4":
+        # Phase 4 starts with one ring on each coloured peg.  Use the arm
+        # closest to each outside region and keep exactly two rings per side.
+        plan = [
+            (PEG_RED, "left_arm", OUTSIDE_LEFT),
+            (PEG_YELLOW, "right_arm", OUTSIDE_RIGHT),
+            (PEG_BLUE, "left_arm", OUTSIDE_LEFT),
+            (PEG_GREEN, "right_arm", OUTSIDE_RIGHT),
+        ]
+        if ring_order == "random":
+            random.shuffle(plan)
+        commands = []
+        rings = []
+        for source_peg, arm, destination in plan:
+            source_rings = sm.get_top_rings_on_peg(
+                env_id, source_peg, num_rings=1
+            )
+            if len(source_rings) != 1:
+                raise RuntimeError(
+                    f"Phase-4 source {source_peg} expected one ring, got {source_rings}"
+                )
+            ring_name = source_rings[0]
+            rings.append(ring_name)
+            commands.extend(
+                [
+                    ("reach", arm, ring_name),
+                    ("grasp", arm, ring_name),
+                    ("reach", arm, destination),
+                    ("release", arm, destination),
                 ]
             )
         return commands, rings
@@ -195,6 +404,22 @@ def save_camera_frame(env, env_id: int, slot: VideoSlot):
     slot.frame_idx += 1
 
 
+def refresh_camera_after_state_override(env) -> None:
+    """Flush stale sensor frames after teleporting the frozen rings.
+
+    ``sync_attached_and_frozen_rings`` writes object poses directly to PhysX.
+    Camera output is buffered, so a single call to ``render`` can still expose
+    the scene from before that write.  Refreshing transformations and rendering
+    a few times makes frame zero correspond to the state machine's phase state.
+    """
+    import omni.physx
+
+    physx = omni.physx.acquire_physx_interface()
+    for _ in range(max(1, args_cli.initial_rerenders)):
+        physx.update_transformations(True, True)
+        env.sim.render()
+
+
 def start_video(env, sm, slots, env_id: int, dataset_dir: Path, video_id: int):
     slot = slots[env_id]
     slot.path = dataset_dir / f"temp_env_{env_id}"
@@ -209,9 +434,7 @@ def start_video(env, sm, slots, env_id: int, dataset_dir: Path, video_id: int):
     sync_mask = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
     sync_mask[env_id] = True
     sync_attached_and_frozen_rings(env, sm, sync_mask)
-    import omni.physx
-    omni.physx.acquire_physx_interface().update_transformations(True, True)
-    env.sim.render()
+    refresh_camera_after_state_override(env)
 
     slot.commands, slot.targeted_rings = build_commands_for_env(
         sm, env_id, args_cli.class_name, args_cli.ring_order, args_cli.arm_mode, args_cli.target_peg, args_cli.num_rings
@@ -223,6 +446,45 @@ def start_video(env, sm, slots, env_id: int, dataset_dir: Path, video_id: int):
     slot.done = False
     save_camera_frame(env, env_id, slot)
     print(f"[collector] env={env_id} started video={video_id:04d} commands={len(slot.commands)}")
+
+
+def collect_start_frames_only(env, sm, dataset_dir: Path, next_id: int) -> int:
+    """Collect independent, correctly rendered one-frame start episodes."""
+    collected = 0
+    while simulation_app.is_running() and collected < args_cli.num_videos:
+        batch_size = min(env.num_envs, args_cli.num_videos - collected)
+        env_ids = list(range(batch_size))
+        env.reset(env_ids=tensor_env_ids(env, env_ids))
+
+        sync_mask = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+        for env_id in env_ids:
+            sm.reset_env(env_id, phase=args_cli.class_name)
+            sync_mask[env_id] = True
+        sync_attached_and_frozen_rings(env, sm, sync_mask)
+
+        for _ in range(max(0, args_cli.start_settle_steps)):
+            env.step(sm.get_action())
+            sync_attached_and_frozen_rings(env, sm, sync_mask)
+        refresh_camera_after_state_override(env)
+
+        for env_id in env_ids:
+            video_id = next_id + collected
+            video_path = dataset_dir / f"{video_id:0{max(1, args_cli.id_width)}d}"
+            if video_path.exists():
+                raise FileExistsError(f"Refusing to overwrite {video_path}")
+            video_path.mkdir(parents=True)
+            slot = VideoSlot()
+            slot.path = video_path
+            slot.video_id = video_id
+            slot.done = False
+            save_camera_frame(env, env_id, slot)
+            collected += 1
+            print(
+                f"[collector] env={env_id} saved start-only "
+                f"video={video_id:04d} frames=1"
+            )
+
+    return collected
 
 
 def finish_video(
@@ -276,6 +538,26 @@ def maybe_issue_next_command(sm: ScriptedStateMachine, slots, env_id: int):
     slot = slots[env_id]
     if slot.done or not sm.all_idle(env_id):
         return
+    if slot.command_idx > 0:
+        previous_verb, previous_arm, previous_target = slot.commands[
+            slot.command_idx - 1
+        ]
+        if previous_verb == "grasp":
+            attached = (
+                sm.attached_target_r[env_id]
+                if previous_arm == "right_arm"
+                else sm.attached_target_l[env_id]
+            )
+            print(
+                f"[collector] env={env_id} grasp_result "
+                f"{previous_arm} target={previous_target} attached={attached}"
+            )
+        elif previous_verb == "release":
+            print(
+                f"[collector] env={env_id} release_result "
+                f"target={previous_target} "
+                f"center={sm.ring_count_on_peg(env_id, BOARD_CENTER)}"
+            )
     if slot.command_idx >= len(slot.commands):
         return
     verb, arm, target = slot.commands[slot.command_idx]
@@ -285,7 +567,7 @@ def maybe_issue_next_command(sm: ScriptedStateMachine, slots, env_id: int):
 
 
 def main():
-    if args_cli.class_name == "phase_1":
+    if args_cli.class_name in {"phase_1", "phase_2", "phase_3", "phase_4"}:
         args_cli.num_rings = 4
     random.seed(args_cli.seed)
     torch.manual_seed(args_cli.seed)
@@ -315,6 +597,15 @@ def main():
     env.reset()
     for env_id in range(env.num_envs):
         sm.reset_env(env_id, phase=args_cli.class_name)
+
+    if args_cli.start_frames_only:
+        successful_videos = collect_start_frames_only(env, sm, dataset_dir, next_id)
+        print(
+            f"[collector] complete: successful={successful_videos} "
+            f"attempted={successful_videos} start_frames_only=True"
+        )
+        env.close()
+        return
 
     slots = [VideoSlot() for _ in range(env.num_envs)]
     successful_videos = 0
@@ -372,16 +663,32 @@ def main():
                     target_path = dataset_dir / f"{save_id:0{max(1, args_cli.id_width)}d}"
                     save_id += 1
                     successful_videos += 1
+                if args_cli.class_name == "phase_1":
+                    failure_reason = (
+                        f"red={sm.ring_count_on_peg(env_id, PEG_RED)} "
+                        f"blue={sm.ring_count_on_peg(env_id, PEG_BLUE)}"
+                    )
+                elif args_cli.class_name == "phase_2":
+                    failure_reason = (
+                        f"center={sm.ring_count_on_peg(env_id, BOARD_CENTER)}"
+                    )
+                elif args_cli.class_name == "phase_3":
+                    failure_reason = " ".join(
+                        f"{peg}={sm.ring_count_on_peg(env_id, peg)}"
+                        for peg in PEG_NAMES
+                    )
+                elif args_cli.class_name == "phase_4":
+                    failure_reason = (
+                        f"outside_right={sm.ring_count_on_peg(env_id, OUTSIDE_RIGHT)} "
+                        f"outside_left={sm.ring_count_on_peg(env_id, OUTSIDE_LEFT)}"
+                    )
+                else:
+                    failure_reason = f"rings_placed={len(slot.targeted_rings)}"
                 finish_video(
                     slots,
                     env_id,
                     success=success,
-                    reason=(
-                        f"red={sm.ring_count_on_peg(env_id, 'peg_red')} "
-                        f"blue={sm.ring_count_on_peg(env_id, 'peg_blue')}"
-                        if args_cli.class_name == "phase_1"
-                        else f"rings_placed={len(slot.targeted_rings)}"
-                    ),
+                    reason=failure_reason,
                     keep_failed=args_cli.keep_failed,
                     target_path=target_path,
                 )

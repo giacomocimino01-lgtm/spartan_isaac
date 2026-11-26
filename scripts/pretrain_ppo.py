@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import random
 import sys
 import numpy as np
 import torch
@@ -28,6 +29,33 @@ parser.add_argument("--output_path", type=str, default="/home/aiprah/Documents/m
 parser.add_argument("--epochs", type=int, default=20, help="Number of training epochs.")
 parser.add_argument("--batch_size", type=int, default=256, help="Training batch size.")
 parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate.")
+parser.add_argument(
+    "--initial_checkpoint",
+    type=str,
+    default=None,
+    help=(
+        "Optional PPO checkpoint whose actor is fine-tuned instead of "
+        "initialising a new policy."
+    ),
+)
+parser.add_argument(
+    "--task_phase",
+    choices=("phase_0", "phase_1", "phase_2", "phase_3", "phase_4"),
+    default="phase_0",
+    help="Task phase used to restore a masked-policy checkpoint.",
+)
+parser.add_argument(
+    "--action_mask_mode",
+    choices=("guided", "goal_agnostic", "minimal"),
+    default="guided",
+    help="Action-mask mode used by --initial_checkpoint.",
+)
+parser.add_argument(
+    "--seed",
+    type=int,
+    default=42,
+    help="Random seed for Python, NumPy, Torch, IsaacLab and PPO.",
+)
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
@@ -69,10 +97,15 @@ from m_dVrk.tasks.manager_based.m_dvrk.m_dvrk_env_cfg import MDvrkEnvCfg
 # Single source of truth — import from m_dVrk package
 from m_dVrk.hrl.constants import VERB_MAP, TARGET_MAP, VERB_TO_ID, TARGET_TO_ID, OBS_DIM
 from m_dVrk.hrl.bc import DummyHRLWrapper, train_bc
+from m_dVrk.hrl.masked_policy import masked_policy_custom_objects
 
 # DummyHRLWrapper is now imported from m_dVrk.hrl.bc above.
 
 def main():
+    random.seed(args_cli.seed)
+    np.random.seed(args_cli.seed)
+    torch.manual_seed(args_cli.seed)
+    torch.cuda.manual_seed_all(args_cli.seed)
     # Prefer dataset under artifacts if default path missing
     if not os.path.exists(args_cli.dataset_path):
         alt = os.path.join(ARTIFACTS_DIR, "datasets", "bc", os.path.basename(args_cli.dataset_path))
@@ -100,6 +133,7 @@ def main():
 
     env_cfg = MDvrkEnvCfg()
     env_cfg.scene.num_envs = 1
+    env_cfg.seed = args_cli.seed
     env_cfg.num_rerenders_on_reset = 2
     isaac_env = ManagerBasedRLEnv(cfg=env_cfg)
     rl_env = DummyHRLWrapper(isaac_env, obs_dim=dataset_obs_dim)
@@ -109,14 +143,36 @@ def main():
         activation_fn=nn.ReLU,
     )
 
-    print("[pretrain] Instantiating PPO model...")
-    model = PPO(
-        "MlpPolicy",
-        rl_env,
-        verbose=1,
-        device="cuda",
-        policy_kwargs=policy_kwargs,
-    )
+    if args_cli.initial_checkpoint is None:
+        print("[pretrain] Instantiating PPO model...")
+        model = PPO(
+            "MlpPolicy",
+            rl_env,
+            verbose=1,
+            device="cuda",
+            seed=args_cli.seed,
+            policy_kwargs=policy_kwargs,
+        )
+    else:
+        if not os.path.isfile(args_cli.initial_checkpoint):
+            raise FileNotFoundError(
+                f"Initial checkpoint not found: {args_cli.initial_checkpoint}"
+            )
+        print(
+            "[pretrain] Loading initial checkpoint for BC fine-tuning: "
+            f"{args_cli.initial_checkpoint}"
+        )
+        custom_objects = masked_policy_custom_objects(
+            args_cli.initial_checkpoint,
+            args_cli.task_phase,
+            args_cli.action_mask_mode,
+        )
+        model = PPO.load(
+            args_cli.initial_checkpoint,
+            env=rl_env,
+            device="cuda",
+            custom_objects=custom_objects,
+        )
 
     # Delegate training to hrl.bc.train_bc
     train_bc(

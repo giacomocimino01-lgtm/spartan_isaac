@@ -15,6 +15,14 @@ import torchvision.transforms as T
 import torchvision.io as io
 import cv2
 
+from m_dVrk.hrl.constants import (
+    PHASE1_DEFAULT_INITIAL_STATE,
+    PHASE1_INITIAL_STATES,
+    PHASE2_DEFAULT_INITIAL_STATE,
+    PHASE2_INITIAL_STATES,
+    RING_NAMES,
+)
+
 import gymnasium as gym
 from gymnasium import spaces
 from stable_baselines3 import PPO
@@ -35,20 +43,50 @@ parser.add_argument(
     "--task_phase",
     type=str,
     default="phase_0",
-    choices=["phase_0", "phase_1"],
-    help="Goal phase to evaluate. phase_1 starts stacked on green and succeeds with 2 rings on red and 2 on blue.",
+    choices=["phase_0", "phase_1", "phase_2", "phase_3", "phase_4"],
+    help=(
+        "Goal phase. Phase 3 starts at center4 and requires one arbitrary "
+        "ring on each coloured peg. Phase 4 moves two rings to each outside side."
+    ),
+)
+parser.add_argument(
+    "--phase2_initial_state",
+    type=str,
+    default=PHASE2_DEFAULT_INITIAL_STATE,
+    choices=PHASE2_INITIAL_STATES,
+    help="Initial state used only for Phase-2 evaluation.",
 )
 parser.add_argument(
     "--phase1_initial_state",
     type=str,
-    default="stack_green",
-    choices=["stack_green", "random_workspace"],
-    help="Initial state used only for phase_1 eval. random_workspace is an OOD stress test with loose rings.",
+    default=PHASE1_DEFAULT_INITIAL_STATE,
+    choices=PHASE1_INITIAL_STATES,
+    help="Initial state used only for Phase-1 evaluation.",
+)
+parser.add_argument(
+    "--phase4_ring_order",
+    nargs=4,
+    choices=RING_NAMES,
+    default=None,
+    metavar=("PEG_RED", "PEG_YELLOW", "PEG_GREEN", "PEG_BLUE"),
+    help=(
+        "Optional fixed Phase-4 layout: four ring names assigned respectively "
+        "to the red, yellow, green and blue pegs. By default the order is shuffled."
+    ),
 )
 parser.add_argument(
     "--randomize_rings",
     action="store_true",
     help="Randomize ring reset positions. By default, rings reset to a fixed deterministic layout.",
+)
+parser.add_argument(
+    "--ring_randomization_scale",
+    type=float,
+    default=1.0,
+    help=(
+        "Fraction of the full ring-reset range used with --randomize_rings "
+        "(0=fixed anchors, 1=full configured range)."
+    ),
 )
 parser.add_argument(
     "--stochastic_actions",
@@ -87,6 +125,60 @@ parser.add_argument(
     "--action_masking",
     action="store_true",
     help="Apply state-aware joint masking while retaining the four-component MultiDiscrete action.",
+)
+parser.add_argument(
+    "--action_mask_mode",
+    choices=("guided", "goal_agnostic", "minimal"),
+    default="guided",
+    help="Select the historical goal-aware mask or the minimal physical mask.",
+)
+parser.add_argument(
+    "--park_before_evaluation",
+    action="store_true",
+    help=(
+        "Diagnostic mode: move both arms to the same neutral park pose used "
+        "between phases by eval_full_task.py before the first policy action."
+    ),
+)
+parser.add_argument(
+    "--phase_entry_park_reset",
+    action="store_true",
+    help="Reset the robots directly into the full-task parked joint pose.",
+)
+parser.add_argument(
+    "--phase_entry_park_neighborhood_probability",
+    type=float,
+    default=0.0,
+    help="Probability of a safe perturbation around parked on each reset.",
+)
+parser.add_argument(
+    "--phase_entry_park_neighborhood_scale",
+    type=float,
+    default=1.0,
+    help="Scale in [0,1] of the parked-pose perturbation ellipsoid.",
+)
+parser.add_argument(
+    "--phase_entry_empirical_bank",
+    type=str,
+    default=None,
+    help="Reset Phase 2 or 4 from a paired empirical joint/ring-state NPZ bank.",
+)
+parser.add_argument(
+    "--phase_entry_empirical_probability",
+    type=float,
+    default=1.0,
+    help="Probability of sampling the empirical bank instead of parked fallback.",
+)
+parser.add_argument(
+    "--phase_entry_empirical_sample_mode",
+    choices=("random", "sequential"),
+    default="random",
+    help="Use random bank rows or cycle through every row in order.",
+)
+parser.add_argument(
+    "--phase_entry_empirical_velocity",
+    action="store_true",
+    help="Restore recorded robot joint velocities from the empirical bank.",
 )
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
@@ -141,6 +233,8 @@ from m_dVrk.hrl.constants import (
     INVALID_COMMAND_PENALTY,
     REWARD_DEBUG_DUMP_INTERVAL, REWARD_DEBUG_DUMP_ENV_IDS,
     REWARD_DEBUG_DUMP_DIR, REWARD_DEBUG_DUMP_MAX_PER_ENV,
+    apply_phase_entry_empirical_bank,
+    apply_phase_entry_park_joint_pose,
 )
 from m_dVrk.hrl.tcc import XIRLResnet18, load_tcc_model
 from m_dVrk.hrl.wrapper import DVRKVisionHRLWrapper
@@ -150,6 +244,52 @@ from m_dVrk.controllers.spartan_state_machine import SPARTANStateMachine
 from m_dVrk.controllers.ring_sync import get_scene_entity_positions_w, sync_attached_and_frozen_rings
 
 PHYSICS_STEPS_PER_RL_STEP = 400
+
+
+def park_arms_before_evaluation(wrapper, max_steps: int = 150, settle_steps: int = 3):
+    """Reproduce the physical arm state at a full-task phase boundary."""
+    sm = wrapper.sm
+    sm.reset_control_state(0)
+    sm.set_new_triplet("park", "right_arm", "None", 0)
+    sm.set_new_triplet("park", "left_arm", "None", 0)
+    active_mask = torch.ones(
+        wrapper.num_envs, dtype=torch.bool, device=wrapper.env.device
+    )
+
+    for step in range(1, max_steps + 1):
+        _, _, terminated, truncated, _ = wrapper.env.step(sm.get_action())
+        done = terminated.to(dtype=torch.bool) | truncated.to(dtype=torch.bool)
+        sync_attached_and_frozen_rings(wrapper.env, sm, active_mask & ~done)
+        if bool(done[0].item()):
+            raise RuntimeError("Environment terminated while parking arms")
+        if sm.all_idle(0):
+            break
+    else:
+        raise RuntimeError("Arms did not reach the park pose")
+
+    for _ in range(settle_steps):
+        _, _, terminated, truncated, _ = wrapper.env.step(sm.get_action())
+        done = terminated.to(dtype=torch.bool) | truncated.to(dtype=torch.bool)
+        sync_attached_and_frozen_rings(wrapper.env, sm, active_mask & ~done)
+        if bool(done[0].item()):
+            raise RuntimeError("Environment terminated while settling parked arms")
+
+    print(f"[INFO] Parked arms in {step + settle_steps} low-level steps")
+    for robot_name in ("robot_right", "robot_left"):
+        robot = wrapper.env.scene[robot_name]
+        joint_values = robot.data.joint_pos[0].detach().cpu().tolist()
+        print(
+            f"[INFO] {robot_name} parked joints: "
+            + ", ".join(
+                f"{name}={value:.9f}"
+                for name, value in zip(robot.joint_names, joint_values, strict=True)
+            )
+        )
+    return wrapper.transition_to_phase(
+        wrapper.task_phase,
+        wrapper.tcc_model,
+        wrapper.goal_embedding,
+    )
 
 def set_seed(seed=42):
     random.seed(seed)
@@ -162,8 +302,32 @@ def set_seed(seed=42):
 def main_eval():
     if args_cli.episodes < 0:
         raise ValueError("--episodes must be non-negative")
+    if not 0.0 <= args_cli.ring_randomization_scale <= 1.0:
+        raise ValueError("--ring_randomization_scale must be in [0, 1]")
+    if not 0.0 <= args_cli.phase_entry_park_neighborhood_probability <= 1.0:
+        raise ValueError("park-neighborhood probability must be in [0, 1]")
+    if not 0.0 <= args_cli.phase_entry_park_neighborhood_scale <= 1.0:
+        raise ValueError("park-neighborhood scale must be in [0, 1]")
+    if not 0.0 <= args_cli.phase_entry_empirical_probability <= 1.0:
+        raise ValueError("empirical-bank probability must be in [0, 1]")
+    if (
+        args_cli.phase_entry_park_neighborhood_probability > 0.0
+        and not args_cli.phase_entry_park_reset
+    ):
+        raise ValueError("park-neighborhood sampling requires --phase_entry_park_reset")
+    if args_cli.phase_entry_empirical_bank and args_cli.phase_entry_park_reset:
+        raise ValueError(
+            "empirical-bank reset and parked-pose reset are mutually exclusive"
+        )
+    if args_cli.phase_entry_empirical_bank and args_cli.task_phase not in {
+        "phase_2",
+        "phase_4",
+    }:
+        raise ValueError("empirical-bank reset is supported for Phase 2 and Phase 4")
     if args_cli.episodes and args_cli.num_envs != 1:
         raise ValueError("Bounded evaluation currently requires --num_envs 1 for unambiguous episode metrics")
+    if args_cli.phase4_ring_order is not None and set(args_cli.phase4_ring_order) != set(RING_NAMES):
+        raise ValueError("--phase4_ring_order must contain every ring exactly once")
     env_cfg = MDvrkEnvCfg()
     env_cfg.scene.num_envs = args_cli.num_envs
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
@@ -171,15 +335,59 @@ def main_eval():
     env_cfg.wait_for_textures = False
     set_seed(args_cli.seed)
     env_cfg.seed = args_cli.seed
+    if args_cli.phase_entry_park_reset:
+        apply_phase_entry_park_joint_pose(
+            env_cfg,
+            neighborhood_probability=(
+                args_cli.phase_entry_park_neighborhood_probability
+            ),
+            neighborhood_scale=args_cli.phase_entry_park_neighborhood_scale,
+        )
+        print(
+            "[INFO] Arm reset mode: full-task parked phase-entry pose "
+            f"(neighborhood_probability="
+            f"{args_cli.phase_entry_park_neighborhood_probability:.2f}, "
+            f"neighborhood_scale={args_cli.phase_entry_park_neighborhood_scale:.2f})"
+        )
+    elif args_cli.phase_entry_empirical_bank:
+        apply_phase_entry_empirical_bank(
+            env_cfg,
+            bank_path=os.path.abspath(args_cli.phase_entry_empirical_bank),
+            empirical_probability=args_cli.phase_entry_empirical_probability,
+            empirical_sample_mode=args_cli.phase_entry_empirical_sample_mode,
+            use_recorded_velocity=args_cli.phase_entry_empirical_velocity,
+            task_phase=args_cli.task_phase,
+        )
+        print(
+            "[INFO] Arm/ring reset mode: empirical full-state bank "
+            f"(path={os.path.abspath(args_cli.phase_entry_empirical_bank)}, "
+            f"probability={args_cli.phase_entry_empirical_probability:.2f}, "
+            f"sample_mode={args_cli.phase_entry_empirical_sample_mode}, "
+            f"recorded_velocity={args_cli.phase_entry_empirical_velocity})"
+        )
     env_cfg.events.reset_rings.params["randomize"] = bool(args_cli.randomize_rings)
+    env_cfg.events.reset_rings.params["randomization_scale"] = float(
+        args_cli.ring_randomization_scale
+    )
     print(
         "[INFO] Ring reset mode: "
-        f"{'randomized' if args_cli.randomize_rings else 'fixed deterministic'}"
+        + (
+            f"randomized (scale={args_cli.ring_randomization_scale:.4f})"
+            if args_cli.randomize_rings
+            else "fixed deterministic"
+        )
     )
-    print(f"[INFO] Task phase: {args_cli.task_phase} | phase1_initial_state: {args_cli.phase1_initial_state}")
+    print(
+        f"[INFO] Task phase: {args_cli.task_phase} | "
+        f"phase1_initial_state: {args_cli.phase1_initial_state} | "
+        f"phase2_initial_state: {args_cli.phase2_initial_state} | "
+        f"phase4_ring_order: {args_cli.phase4_ring_order or 'shuffled'}"
+    )
     print(f"[INFO] Simulation device: {env_cfg.sim.device}")
     
     isaac_env = ManagerBasedRLEnv(cfg=env_cfg)
+    if args_cli.phase_entry_park_reset:
+        isaac_env.phase_entry_pose_scale = 1.0
     sm = SPARTANStateMachine(isaac_env)
     tcc = XIRLResnet18(32).to(isaac_env.device)
     
@@ -208,12 +416,17 @@ def main_eval():
         print(f"[ERR] Weights: {e}")
 
     tcc.eval()
-    rl_env = DVRKVisionHRLWrapper(
+    task_wrapper = DVRKVisionHRLWrapper(
         isaac_env,
         sm,
         tcc,
         task_phase=args_cli.task_phase,
+        action_mask_mode=args_cli.action_mask_mode,
+        phase1_initial_state=args_cli.phase1_initial_state,
+        phase2_initial_state=args_cli.phase2_initial_state,
+        phase4_ring_order=args_cli.phase4_ring_order,
     )
+    rl_env = task_wrapper
     
     # Compute goal embedding on the raw unwrapped environment first
     proc = T.Compose([T.Resize((112, 112), antialias=True)])
@@ -262,7 +475,11 @@ def main_eval():
     print(f"[INFO] Loading model from: {args_cli.checkpoint}")
     custom_objects = None
     if args_cli.action_masking:
-        custom_objects = masked_policy_custom_objects(args_cli.checkpoint, args_cli.task_phase)
+        custom_objects = masked_policy_custom_objects(
+            args_cli.checkpoint,
+            args_cli.task_phase,
+            args_cli.action_mask_mode,
+        )
     model = PPO.load(
         args_cli.checkpoint,
         env=rl_env,
@@ -273,6 +490,10 @@ def main_eval():
     video_frames = []
     print("[INFO] Starting evaluation...")
     obs = rl_env.reset()
+    if args_cli.park_before_evaluation:
+        obs = park_arms_before_evaluation(task_wrapper)
+        if isinstance(rl_env, VecNormalize):
+            obs = rl_env.normalize_obs(obs)
     
     episode_count = 0
     steps = 0
@@ -320,8 +541,10 @@ def main_eval():
                 f"[DONE] success={info0.get('is_success', False)} "
                 f"rings_complete={info0.get('rings_complete', False)} "
                 f"red={info0.get('red_peg_ring_count', 0)} "
+                f"yellow={info0.get('yellow_peg_ring_count', 0)} "
                 f"blue={info0.get('blue_peg_ring_count', 0)} "
                 f"green={info0.get('green_peg_ring_count', 0)} "
+                f"center={info0.get('board_center_ring_count', 0)} "
                 f"distance={info0.get('terminal_distance', float('nan')):.4f}"
             )
 
@@ -332,15 +555,71 @@ def main_eval():
                     "episode": episode_count,
                     "deterministic": not args_cli.stochastic_actions,
                     "action_masking": args_cli.action_masking,
+                    "action_mask_mode": args_cli.action_mask_mode,
+                    "park_before_evaluation": args_cli.park_before_evaluation,
+                    "phase1_initial_state": info0.get(
+                        "phase1_initial_state", args_cli.phase1_initial_state
+                    ),
+                    "phase1_resolved_initial_state": info0.get(
+                        "phase1_resolved_initial_state", ""
+                    ),
+                    "phase1_initial_layout": info0.get(
+                        "phase1_initial_layout", ""
+                    ),
+                    "phase2_initial_state": info0.get(
+                        "phase2_initial_state", args_cli.phase2_initial_state
+                    ),
+                    "phase2_resolved_initial_state": info0.get(
+                        "phase2_resolved_initial_state", ""
+                    ),
+                    "phase3_initial_state": info0.get(
+                        "phase3_initial_state", "center4"
+                    ),
+                    "phase3_resolved_initial_state": info0.get(
+                        "phase3_resolved_initial_state", ""
+                    ),
+                    "phase4_initial_state": info0.get(
+                        "phase4_initial_state", "one_per_coloured_peg"
+                    ),
+                    "phase4_resolved_initial_state": info0.get(
+                        "phase4_resolved_initial_state", ""
+                    ),
+                    "phase4_ring_order": ",".join(args_cli.phase4_ring_order or ()),
+                    "phase4_empirical_entry_index": info0.get(
+                        "phase4_empirical_entry_index", ""
+                    ),
+                    "phase4_empirical_entry_enabled": info0.get(
+                        "phase4_empirical_entry_enabled", ""
+                    ),
                     "success": bool(info0.get("is_success", False)),
                     "episode_steps": steps + 1,
                     "episode_return": episode_return,
                     "terminal_distance": float(info0.get("terminal_distance", float("nan"))),
                     "green_peg_ring_count": int(info0.get("green_peg_ring_count", 0)),
                     "red_peg_ring_count": int(info0.get("red_peg_ring_count", 0)),
+                    "yellow_peg_ring_count": int(info0.get("yellow_peg_ring_count", 0)),
                     "blue_peg_ring_count": int(info0.get("blue_peg_ring_count", 0)),
+                    "board_center_ring_count": int(info0.get("board_center_ring_count", 0)),
+                    "outside_right_ring_count": int(
+                        info0.get("outside_right_ring_count", 0)
+                    ),
+                    "outside_left_ring_count": int(
+                        info0.get("outside_left_ring_count", 0)
+                    ),
                     "invalid_commands": invalid_commands,
                     "bimanual_steps": bimanual_steps,
+                    "left_active_steps": int(
+                        info0.get("episode_left_active_steps", 0)
+                    ),
+                    "right_active_steps": int(
+                        info0.get("episode_right_active_steps", 0)
+                    ),
+                    "joint_action_changes": int(
+                        info0.get("episode_joint_action_changes", 0)
+                    ),
+                    "free_arm_step_slots": int(
+                        info0.get("episode_free_arm_step_slots", 0)
+                    ),
                 }
             )
             
@@ -361,6 +640,10 @@ def main_eval():
             bimanual_steps = 0
             if args_cli.episodes and episode_count >= args_cli.episodes:
                 break
+            if args_cli.park_before_evaluation:
+                obs = park_arms_before_evaluation(task_wrapper)
+                if isinstance(rl_env, VecNormalize):
+                    obs = rl_env.normalize_obs(obs)
         else:
             steps += 1
 

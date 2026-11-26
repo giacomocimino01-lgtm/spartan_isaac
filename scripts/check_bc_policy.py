@@ -40,6 +40,8 @@ from m_dVrk.hrl.constants import (
     RING_NAMES,
     PEG_NAMES,
     OBS_DIM,
+    BOARD_CENTER_TARGET_ID,
+    target_name_for_phase,
 )
 
 ACTION_HEADS = ("verb_l", "target_l", "verb_r", "target_r")
@@ -112,19 +114,27 @@ def parse_args() -> argparse.Namespace:
         help="VecNormalize pickle to use when --normalization=vecnormalize.",
     )
     parser.add_argument("--batch_size", type=int, default=4096)
+    parser.add_argument(
+        "--task_phase",
+        choices=("phase_0", "phase_1", "phase_2", "phase_3", "phase_4"),
+        default="phase_0",
+        help="Phase used to decode phase-specific target aliases.",
+    )
     parser.add_argument("--limit", type=int, default=0, help="Limit samples for a quick check. 0 means all.")
     parser.add_argument("--device", default="cuda", help="Torch device for policy inference.")
     return parser.parse_args()
 
 
-def format_action(row: np.ndarray) -> str:
+def format_action(row: np.ndarray, task_phase: str) -> str:
+    verb_l = VERB_MAP[int(row[0])]
+    verb_r = VERB_MAP[int(row[2])]
     return (
-        f"L={VERB_MAP[int(row[0])]}->{TARGET_MAP[int(row[1])]} "
-        f"R={VERB_MAP[int(row[2])]}->{TARGET_MAP[int(row[3])]}"
+        f"L={verb_l}->{target_name_for_phase(int(row[1]), task_phase, verb_l)} "
+        f"R={verb_r}->{target_name_for_phase(int(row[3]), task_phase, verb_r)}"
     )
 
 
-def semantic_invalid_mask(actions: np.ndarray) -> np.ndarray:
+def semantic_invalid_mask(actions: np.ndarray, task_phase: str) -> np.ndarray:
     invalid = np.zeros(actions.shape[0], dtype=bool)
     for verb_col, target_col in ((0, 1), (2, 3)):
         verb = actions[:, verb_col]
@@ -132,20 +142,23 @@ def semantic_invalid_mask(actions: np.ndarray) -> np.ndarray:
         invalid |= (verb == IDLE_VERB) & (target != NONE_TARGET)
         invalid |= (verb != IDLE_VERB) & (target == NONE_TARGET)
         invalid |= (verb == 1) & ~np.isin(target, list(RING_TARGET_IDS))
-        invalid |= (verb == 2) & ~np.isin(target, list(PEG_TARGET_IDS))
+        release_targets = set(PEG_TARGET_IDS)
+        if task_phase == "phase_2":
+            release_targets.add(BOARD_CENTER_TARGET_ID)
+        invalid |= (verb == 2) & ~np.isin(target, list(release_targets))
     return invalid
 
 
-def print_action_distribution(title: str, actions: np.ndarray, max_rows: int = 10) -> None:
+def print_action_distribution(title: str, actions: np.ndarray, task_phase: str, max_rows: int = 10) -> None:
     print(f"\n[{title}] top complete actions")
     counts = Counter(map(tuple, actions.tolist()))
     for row, count in counts.most_common(max_rows):
         arr = np.asarray(row, dtype=np.int64)
         pct = 100.0 * count / len(actions)
-        print(f"  {arr.tolist()}  {count:7d}  {pct:6.2f}%  {format_action(arr)}")
+        print(f"  {arr.tolist()}  {count:7d}  {pct:6.2f}%  {format_action(arr, task_phase)}")
 
 
-def describe_dataset(obs: np.ndarray, actions: np.ndarray) -> None:
+def describe_dataset(obs: np.ndarray, actions: np.ndarray, task_phase: str) -> None:
     print(f"[dataset] obs shape={obs.shape} dtype={obs.dtype}")
     print(f"[dataset] actions shape={actions.shape} dtype={actions.dtype}")
     print(f"[dataset] obs finite={np.isfinite(obs).all()} actions finite={np.isfinite(actions).all()}")
@@ -160,7 +173,7 @@ def describe_dataset(obs: np.ndarray, actions: np.ndarray) -> None:
                 f"[dataset] {name:9s} mean/std/min/max="
                 f"{chunk.mean():.6f}/{chunk.std():.6f}/{chunk.min():.6f}/{chunk.max():.6f}"
             )
-    print(f"[dataset] label semantic-invalid rate={semantic_invalid_mask(actions).mean() * 100:.3f}%")
+    print(f"[dataset] label semantic-invalid rate={semantic_invalid_mask(actions, task_phase).mean() * 100:.3f}%")
 
 
 def normalize_observations(
@@ -235,7 +248,7 @@ def main() -> None:
         obs = obs[: args.limit]
         labels = labels[: args.limit]
 
-    describe_dataset(obs, labels)
+    describe_dataset(obs, labels, args.task_phase)
 
     # Check observation contract
     if obs.shape[1] != OBS_DIM:
@@ -280,13 +293,13 @@ def main() -> None:
     for name, acc in zip(ACTION_HEADS, per_head):
         print(f"[eval] {name:8s} accuracy={acc * 100:.2f}%")
 
-    invalid_pred = semantic_invalid_mask(pred).mean() * 100.0
+    invalid_pred = semantic_invalid_mask(pred, args.task_phase).mean() * 100.0
     changed = (pred != labels).any(axis=1).mean() * 100.0
     print(f"[eval] prediction semantic-invalid rate={invalid_pred:.3f}%")
     print(f"[eval] any-head mismatch rate={changed:.2f}%")
 
-    print_action_distribution("labels", labels)
-    print_action_distribution("predictions", pred)
+    print_action_distribution("labels", labels, args.task_phase)
+    print_action_distribution("predictions", pred, args.task_phase)
 
 
 if __name__ == "__main__":

@@ -2,13 +2,402 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
 import torch
 
 import isaaclab.utils.math as math_utils
 from isaaclab.assets import Articulation, RigidObject
 from isaaclab.envs import ManagerBasedEnv
 
-from m_dVrk.hrl.curriculum import scaled_interval_around_anchor
+from m_dVrk.hrl.curriculum import (
+    phase_entry_pose_sampling_bounds,
+    scaled_interval_around_anchor,
+)
+
+
+def reset_joints_from_empirical_bank(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor,
+    bank_path: str,
+    bank_side: str,
+    fallback_joint_positions: dict[str, float],
+    empirical_probability: float = 1.0,
+    empirical_sample_mode: str = "random",
+    sample_owner: bool = True,
+    use_recorded_velocity: bool = False,
+    expected_task_phase: str = "phase_4",
+    asset_cfg=None,
+):
+    """Reset an arm from paired empirical robot/ring configurations.
+
+    The right-arm reset samples one bank row and the exact/empirical choice;
+    the left-arm reset reuses both so the two arms always come from the same
+    physical handoff.  Episodes not assigned to the empirical component use
+    the calibrated deterministic parked pose.
+    """
+
+    if asset_cfg is None:
+        raise ValueError("asset_cfg is required")
+    if bank_side not in {"right", "left"}:
+        raise ValueError("bank_side must be 'right' or 'left'")
+    if not 0.0 <= empirical_probability <= 1.0:
+        raise ValueError("empirical_probability must be in [0, 1]")
+    if empirical_sample_mode not in {"random", "sequential"}:
+        raise ValueError("empirical_sample_mode must be 'random' or 'sequential'")
+
+    cache = getattr(env, "_empirical_entry_bank", None)
+    if cache is None or cache["path"] != bank_path:
+        with np.load(bank_path, allow_pickle=False) as data:
+            full_state_keys = {
+                "ring_root_state_local",
+                "ring_frozen_mask",
+                "ring_support_peg",
+                "ring_stack_level",
+                "ring_names",
+            }
+            attachment_keys = {"attached_target_right", "attached_target_left"}
+            present_full_state_keys = full_state_keys.intersection(data.files)
+            if present_full_state_keys and present_full_state_keys != full_state_keys:
+                missing = sorted(full_state_keys - present_full_state_keys)
+                raise ValueError(
+                    "Incomplete empirical Phase-4 full-state bank; missing: "
+                    + ", ".join(missing)
+                )
+            present_attachment_keys = attachment_keys.intersection(data.files)
+            if present_attachment_keys and present_attachment_keys != attachment_keys:
+                missing = sorted(attachment_keys - present_attachment_keys)
+                raise ValueError(
+                    "Incomplete empirical attachment state; missing: "
+                    + ", ".join(missing)
+                )
+            bank_task_phase = (
+                str(np.asarray(data["task_phase"]).item())
+                if "task_phase" in data.files
+                else "phase_4"
+            )
+            if bank_task_phase != expected_task_phase:
+                raise ValueError(
+                    f"Empirical bank task_phase={bank_task_phase!r} does not "
+                    f"match requested {expected_task_phase!r}"
+                )
+            cache = {
+                "path": bank_path,
+                "task_phase": bank_task_phase,
+                "joint_pos_right": torch.as_tensor(
+                    data["joint_pos_right"], dtype=torch.float32, device=env.device
+                ),
+                "joint_vel_right": torch.as_tensor(
+                    data["joint_vel_right"], dtype=torch.float32, device=env.device
+                ),
+                "joint_pos_left": torch.as_tensor(
+                    data["joint_pos_left"], dtype=torch.float32, device=env.device
+                ),
+                "joint_vel_left": torch.as_tensor(
+                    data["joint_vel_left"], dtype=torch.float32, device=env.device
+                ),
+                "joint_names_right": tuple(str(x) for x in data["joint_names_right"]),
+                "joint_names_left": tuple(str(x) for x in data["joint_names_left"]),
+                "has_full_state": present_full_state_keys == full_state_keys,
+                "has_attachment_state": present_attachment_keys == attachment_keys,
+            }
+            if cache["has_full_state"]:
+                cache.update(
+                    {
+                        "ring_root_state_local": torch.as_tensor(
+                            data["ring_root_state_local"],
+                            dtype=torch.float32,
+                            device=env.device,
+                        ),
+                        "ring_frozen_mask": torch.as_tensor(
+                            data["ring_frozen_mask"],
+                            dtype=torch.bool,
+                            device=env.device,
+                        ),
+                        "ring_support_peg": np.asarray(
+                            data["ring_support_peg"], dtype=str
+                        ).copy(),
+                        "ring_stack_level": torch.as_tensor(
+                            data["ring_stack_level"],
+                            dtype=torch.long,
+                            device=env.device,
+                        ),
+                        "ring_names": tuple(str(x) for x in data["ring_names"]),
+                    }
+                )
+            if cache["has_attachment_state"]:
+                cache.update(
+                    {
+                        "attached_target_right": np.asarray(
+                            data["attached_target_right"], dtype=str
+                        ).copy(),
+                        "attached_target_left": np.asarray(
+                            data["attached_target_left"], dtype=str
+                        ).copy(),
+                    }
+                )
+        if cache["joint_pos_right"].shape[0] == 0:
+            raise ValueError(f"Empirical entry bank is empty: {bank_path}")
+        if cache["joint_pos_right"].shape[0] != cache["joint_pos_left"].shape[0]:
+            raise ValueError("Right/left empirical entry banks have different sizes")
+        if cache["has_attachment_state"]:
+            bank_size = cache["joint_pos_right"].shape[0]
+            for key in ("attached_target_right", "attached_target_left"):
+                if tuple(cache[key].shape) != (bank_size,):
+                    raise ValueError(
+                        f"{key} must have shape ({bank_size},), got "
+                        f"{tuple(cache[key].shape)}"
+                    )
+        if cache["has_full_state"]:
+            bank_size = cache["joint_pos_right"].shape[0]
+            ring_state = cache["ring_root_state_local"]
+            if ring_state.ndim != 3 or ring_state.shape[0] != bank_size:
+                raise ValueError(
+                    "ring_root_state_local must have shape (states, rings, 13)"
+                )
+            if ring_state.shape[2] != 13:
+                raise ValueError(
+                    "ring_root_state_local must contain pose and velocity (13 values)"
+                )
+            expected_shape = ring_state.shape[:2]
+            for key in (
+                "ring_frozen_mask",
+                "ring_support_peg",
+                "ring_stack_level",
+            ):
+                if tuple(cache[key].shape) != tuple(expected_shape):
+                    raise ValueError(
+                        f"{key} shape {tuple(cache[key].shape)} does not match "
+                        f"{tuple(expected_shape)}"
+                    )
+            if len(cache["ring_names"]) != expected_shape[1]:
+                raise ValueError("ring_names length does not match ring state columns")
+        setattr(env, "_empirical_entry_bank", cache)
+        # Compatibility with old Phase-4 diagnostics.
+        setattr(env, "_phase4_empirical_entry_bank", cache)
+
+    sample_indices = getattr(env, "_empirical_entry_indices", None)
+    sample_enabled = getattr(env, "_empirical_entry_enabled", None)
+    if sample_indices is None or sample_indices.shape[0] != env.num_envs:
+        sample_indices = torch.zeros(
+            env.num_envs, dtype=torch.long, device=env.device
+        )
+        sample_enabled = torch.zeros(
+            env.num_envs, dtype=torch.bool, device=env.device
+        )
+        setattr(env, "_empirical_entry_indices", sample_indices)
+        setattr(env, "_empirical_entry_enabled", sample_enabled)
+        setattr(env, "_phase4_empirical_entry_indices", sample_indices)
+        setattr(env, "_phase4_empirical_entry_enabled", sample_enabled)
+
+    bank_size = int(cache["joint_pos_right"].shape[0])
+    if sample_owner:
+        if empirical_sample_mode == "sequential":
+            counter = int(getattr(env, "_empirical_entry_counter", 0))
+            sample_indices[env_ids] = (
+                torch.arange(len(env_ids), device=env.device, dtype=torch.long)
+                + counter
+            ) % bank_size
+            setattr(
+                env,
+                "_empirical_entry_counter",
+                counter + len(env_ids),
+            )
+        else:
+            sample_indices[env_ids] = torch.randint(
+                bank_size, (len(env_ids),), device=env.device
+            )
+        sample_enabled[env_ids] = (
+            torch.rand(len(env_ids), device=env.device) < empirical_probability
+        )
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    joint_pos = asset.data.default_joint_pos[env_ids].clone()
+    joint_vel = asset.data.default_joint_vel[env_ids].clone()
+    joint_name_to_id = {name: idx for idx, name in enumerate(asset.joint_names)}
+
+    unknown_fallback = sorted(set(fallback_joint_positions) - set(joint_name_to_id))
+    if unknown_fallback:
+        raise ValueError(
+            f"Unknown fallback joints for {asset_cfg.name!r}: "
+            + ", ".join(unknown_fallback)
+        )
+    for joint_name, value in fallback_joint_positions.items():
+        joint_pos[:, joint_name_to_id[joint_name]] = float(value)
+    joint_vel.zero_()
+
+    names = cache[f"joint_names_{bank_side}"]
+    unknown_bank = sorted(set(names) - set(joint_name_to_id))
+    if unknown_bank:
+        raise ValueError(
+            f"Unknown bank joints for {asset_cfg.name!r}: " + ", ".join(unknown_bank)
+        )
+    enabled = sample_enabled[env_ids]
+    if bool(enabled.any().item()):
+        bank_rows = sample_indices[env_ids][enabled]
+        bank_pos = cache[f"joint_pos_{bank_side}"][bank_rows]
+        bank_vel = cache[f"joint_vel_{bank_side}"][bank_rows]
+        enabled_rows = enabled.nonzero(as_tuple=False).flatten()
+        for bank_col, joint_name in enumerate(names):
+            asset_col = joint_name_to_id[joint_name]
+            joint_pos[enabled_rows, asset_col] = bank_pos[:, bank_col]
+            if use_recorded_velocity:
+                joint_vel[enabled_rows, asset_col] = bank_vel[:, bank_col]
+
+    joint_pos_limits = asset.data.soft_joint_pos_limits[env_ids]
+    joint_pos.clamp_(joint_pos_limits[..., 0], joint_pos_limits[..., 1])
+    asset.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
+
+
+def reset_joints_to_interpolated_pose(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor,
+    target_joint_positions: dict[str, float],
+    scale: float = 1.0,
+    sample_uniform_scale: bool = False,
+    sample_frontier_width: float | None = None,
+    sample_owner: bool = True,
+    neighborhood_joint_scales: dict[str, float] | None = None,
+    neighborhood_probability: float = 0.0,
+    neighborhood_scale: float = 1.0,
+    neighborhood_owner: bool = True,
+    scale_attribute: str = "phase_entry_pose_scale",
+    asset_cfg=None,
+):
+    """Reset joints between their canonical default and a phase-entry pose.
+
+    Unlike changing ``ArticulationCfg.init_state``, this keeps
+    ``asset.data.default_joint_pos`` canonical.  Consequently Isaac Lab's
+    ``joint_pos_rel`` observation uses the same reference frame during
+    standalone training and full-task inference.
+
+    When ``sample_uniform_scale`` is enabled, the owner arm samples one
+    interpolation factor per environment and the second arm reuses it.  With
+    no frontier width the interval is ``[0, current_scale]``; with a width it
+    is ``[current_scale - width, current_scale]`` (clamped at zero).
+    """
+
+    if asset_cfg is None:
+        raise ValueError("asset_cfg is required")
+
+    current_scale = float(getattr(env, scale_attribute, scale))
+    if not 0.0 <= current_scale <= 1.0:
+        raise ValueError(f"{scale_attribute} must be in [0, 1]")
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    joint_pos = asset.data.default_joint_pos[env_ids].clone()
+    joint_vel = asset.data.default_joint_vel[env_ids].clone()
+    target_pos = joint_pos.clone()
+
+    joint_name_to_id = {name: idx for idx, name in enumerate(asset.joint_names)}
+    unknown = sorted(set(target_joint_positions) - set(joint_name_to_id))
+    if unknown:
+        raise ValueError(
+            f"Unknown joints for asset {asset_cfg.name!r}: {', '.join(unknown)}"
+        )
+    for joint_name, value in target_joint_positions.items():
+        target_pos[:, joint_name_to_id[joint_name]] = float(value)
+
+    cache_name = "_phase_entry_pose_sampled_scale"
+    sampled_scale = getattr(env, cache_name, None)
+    if sampled_scale is None or sampled_scale.shape[0] != env.num_envs:
+        sampled_scale = torch.zeros(env.num_envs, device=joint_pos.device)
+        setattr(env, cache_name, sampled_scale)
+
+    if sample_owner:
+        if sample_uniform_scale and current_scale > 0.0:
+            frontier_width = getattr(
+                env,
+                "phase_entry_pose_frontier_width",
+                sample_frontier_width,
+            )
+            lower, upper = phase_entry_pose_sampling_bounds(
+                current_scale,
+                frontier_width,
+            )
+            alpha = lower + torch.rand(
+                len(env_ids), device=joint_pos.device
+            ) * (upper - lower)
+        else:
+            alpha = torch.full(
+                (len(env_ids),), current_scale, device=joint_pos.device
+            )
+        sampled_scale[env_ids] = alpha
+    else:
+        alpha = sampled_scale[env_ids]
+
+    joint_pos.lerp_(target_pos, alpha.unsqueeze(1))
+
+    if neighborhood_joint_scales and neighborhood_probability > 0.0:
+        if not 0.0 <= neighborhood_probability <= 1.0:
+            raise ValueError("neighborhood_probability must be in [0, 1]")
+        if not 0.0 <= neighborhood_scale <= 1.0:
+            raise ValueError("neighborhood_scale must be in [0, 1]")
+
+        noise_joint_ids: list[int] = []
+        noise_scales: list[float] = []
+        unknown_noise_joints = sorted(
+            set(neighborhood_joint_scales) - set(joint_name_to_id)
+        )
+        if unknown_noise_joints:
+            raise ValueError(
+                f"Unknown neighborhood joints for asset {asset_cfg.name!r}: "
+                + ", ".join(unknown_noise_joints)
+            )
+        for joint_name, joint_scale in neighborhood_joint_scales.items():
+            if float(joint_scale) < 0.0:
+                raise ValueError("neighborhood joint scales must be non-negative")
+            noise_joint_ids.append(joint_name_to_id[joint_name])
+            noise_scales.append(float(joint_scale) * float(neighborhood_scale))
+
+        enabled_cache_name = "_phase_entry_park_neighborhood_enabled"
+        radius_cache_name = "_phase_entry_park_neighborhood_radius"
+        noise_enabled = getattr(env, enabled_cache_name, None)
+        radius = getattr(env, radius_cache_name, None)
+        if noise_enabled is None or noise_enabled.shape[0] != env.num_envs:
+            noise_enabled = torch.zeros(
+                env.num_envs, dtype=torch.bool, device=joint_pos.device
+            )
+            setattr(env, enabled_cache_name, noise_enabled)
+        if radius is None or radius.shape[0] != env.num_envs:
+            radius = torch.zeros(env.num_envs, device=joint_pos.device)
+            setattr(env, radius_cache_name, radius)
+
+        dimensions = len(noise_joint_ids)
+        if neighborhood_owner:
+            episode_enabled = (
+                torch.rand(len(env_ids), device=joint_pos.device)
+                < neighborhood_probability
+            )
+            # r = U^(1/d) makes samples uniform by volume inside the unit ball.
+            episode_radius = torch.rand(
+                len(env_ids), device=joint_pos.device
+            ).pow(1.0 / max(dimensions, 1))
+            episode_radius *= episode_enabled.to(dtype=episode_radius.dtype)
+            noise_enabled[env_ids] = episode_enabled
+            radius[env_ids] = episode_radius
+        else:
+            episode_enabled = noise_enabled[env_ids]
+            episode_radius = radius[env_ids]
+
+        if dimensions:
+            direction = torch.randn(
+                (len(env_ids), dimensions), device=joint_pos.device
+            )
+            direction /= torch.linalg.vector_norm(
+                direction, dim=1, keepdim=True
+            ).clamp_min(1e-8)
+            semi_axes = torch.tensor(
+                noise_scales,
+                dtype=joint_pos.dtype,
+                device=joint_pos.device,
+            )
+            offsets = direction * episode_radius.unsqueeze(1) * semi_axes
+            joint_pos[:, noise_joint_ids] += offsets
+
+    joint_pos_limits = asset.data.soft_joint_pos_limits[env_ids]
+    joint_pos.clamp_(joint_pos_limits[..., 0], joint_pos_limits[..., 1])
+    joint_vel.zero_()
+    asset.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
 
 
 def _resolve_asset_prim_path(env: ManagerBasedEnv, asset_name: str, env_id: int) -> str:

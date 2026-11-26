@@ -9,7 +9,7 @@ The state machine is the sole owner of:
     SETTLE, CLOSE_GRIPPER, LIFT_UP, OPEN_GRIPPER)
   - ring attachment and frozen-placement bookkeeping
   - peg inventory counts
-  - per-environment reset logic (phase 0 and phase 1)
+  - per-environment reset logic for all implemented task phases
 """
 
 from __future__ import annotations
@@ -24,7 +24,28 @@ from m_dVrk.controllers.ring_sync import (
     get_scene_entity_position_w,
     _get_scene_entity_position_w,
 )
-from m_dVrk.hrl.constants import RING_NAMES, ALL_PEG_NAMES, PEG_GREEN, PEG_RED, PEG_BLUE
+from m_dVrk.hrl.constants import (
+    RING_NAMES,
+    PEG_NAMES,
+    ALL_PEG_NAMES,
+    BOARD_CENTER,
+    OUTSIDE_LEFT,
+    OUTSIDE_RIGHT,
+    OUTSIDE_REGION_LOCAL_XY,
+    OUTSIDE_SLOT_LATERAL_OFFSETS,
+    OUTSIDE_TARGETS,
+    PEG_GREEN,
+    PEG_RED,
+    PEG_BLUE,
+    PHASE1_DEFAULT_INITIAL_STATE,
+    PHASE1_INITIAL_STATES,
+    PHASE2_DEFAULT_INITIAL_STATE,
+    PHASE2_INITIAL_STATES,
+    PHASE3_DEFAULT_INITIAL_STATE,
+    PHASE3_INITIAL_STATES,
+    PHASE4_DEFAULT_INITIAL_STATE,
+    PHASE4_INITIAL_STATES,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -37,6 +58,8 @@ INITIAL_PHASE_BY_VERB: dict[str, str] = {
     "reach":   "MOVE_TO_REACH_ENTRY",
     "grasp":   "CLOSE_GRIPPER",
     "release": "OPEN_GRIPPER",
+    "park":    "MOVE_TO_REACH_ENTRY",
+    "home":    "MOVE_TO_REACH_ENTRY",
 }
 
 VALID_PHASES_BY_VERB: dict[str, set[str]] = {
@@ -49,6 +72,8 @@ VALID_PHASES_BY_VERB: dict[str, set[str]] = {
     },
     "grasp":   {"CLOSE_GRIPPER", "LIFT_UP"},
     "release": {"OPEN_GRIPPER"},
+    "park":    {"MOVE_TO_REACH_ENTRY"},
+    "home":    {"MOVE_TO_REACH_ENTRY"},
 }
 
 
@@ -85,6 +110,7 @@ class SPARTANStateMachine:
     TOLERANCE_XY: float = 0.006
     TOLERANCE_Z: float = 0.006
     RING_THICKNESS: float = 0.001
+    CENTER_RING_THICKNESS: float = 0.0025
 
     def __init__(self, env, debug_mode: bool = False) -> None:
         self.debug_mode = debug_mode
@@ -116,6 +142,11 @@ class SPARTANStateMachine:
         self.release_target_l: list = [None] * self.num_envs
         self.release_committed_r: list[bool] = [False] * self.num_envs
         self.release_committed_l: list[bool] = [False] * self.num_envs
+        # Diagnostic latch used to collect genuine recovery states.  It is not
+        # exposed in the policy observation and is cleared by reset or by the
+        # next successful reach of the corresponding arm.
+        self.last_reach_failed_r: list[bool] = [False] * self.num_envs
+        self.last_reach_failed_l: list[bool] = [False] * self.num_envs
 
         # --- Ring / peg bookkeeping ---
         self.peg_inventory: dict[str, torch.Tensor] = {
@@ -137,12 +168,27 @@ class SPARTANStateMachine:
             ring: torch.full((self.num_envs,), -1, dtype=torch.long, device=self.device)
             for ring in RING_NAMES
         }
+        self.last_phase1_initial_state: list[str | None] = [None] * self.num_envs
+        self.last_phase2_initial_state: list[str | None] = [None] * self.num_envs
+        self.last_phase3_initial_state: list[str | None] = [None] * self.num_envs
+        self.last_phase4_initial_state: list[str | None] = [None] * self.num_envs
 
         # --- Robot tip indices ---
         robot_r = env.scene["robot_right"]
         robot_l = env.scene["robot_left"]
         self._tip_idx_r = robot_r.find_bodies("psm_tool_tip_link")[0][0]
         self._tip_idx_l = robot_l.find_bodies("psm_tool_tip_link")[0][0]
+        # Capture the physical reset pose before either arm moves.  A
+        # high-level phase can later return to this policy training
+        # distribution without teleporting the robot or changing the rings.
+        self._home_tip_pos_r_local = (
+            robot_r.data.body_pos_w[:, self._tip_idx_r]
+            - env.scene.env_origins
+        ).clone()
+        self._home_tip_pos_l_local = (
+            robot_l.data.body_pos_w[:, self._tip_idx_l]
+            - env.scene.env_origins
+        ).clone()
         self.target_quat_r = self._get_tip_quat_in_root(robot_r, self._tip_idx_r).clone()
         self.target_quat_l = self._get_tip_quat_in_root(robot_l, self._tip_idx_l).clone()
 
@@ -254,6 +300,15 @@ class SPARTANStateMachine:
         )
         return origin + local_entry
 
+    def _get_home_position(self, subject: str, env_id: int) -> torch.Tensor:
+        """Return the end-effector pose captured at the canonical reset."""
+        local_position = (
+            self._home_tip_pos_r_local[env_id]
+            if subject == "right_arm"
+            else self._home_tip_pos_l_local[env_id]
+        )
+        return self.env.scene.env_origins[env_id] + local_position
+
     def _start_reach_recovery(
         self,
         sub_state: list[str],
@@ -263,6 +318,10 @@ class SPARTANStateMachine:
         target_name: str,
         failed_phase: str,
     ) -> None:
+        if subject == "right_arm":
+            self.last_reach_failed_r[env_id] = True
+        else:
+            self.last_reach_failed_l[env_id] = True
         if self.debug_mode:
             print(
                 f"[DEBUG SM] Env {env_id} - {subject} reach timeout for "
@@ -273,17 +332,42 @@ class SPARTANStateMachine:
     def _resolve_release_target(
         self, target_name: str | None, last_target: str | None
     ) -> str | None:
-        if isinstance(target_name, str) and target_name.startswith("peg_"):
+        if self._is_release_destination(target_name):
             return target_name
-        if isinstance(last_target, str) and last_target.startswith("peg_"):
+        if self._is_release_destination(last_target):
             return last_target
         return None
 
     def _is_peg_target(self, target_name: str | None) -> bool:
         return isinstance(target_name, str) and target_name.startswith("peg_")
 
+    def _is_release_destination(self, target_name: str | None) -> bool:
+        return (
+            self._is_peg_target(target_name)
+            or target_name == BOARD_CENTER
+            or target_name in OUTSIDE_TARGETS
+        )
+
     def _get_reach_settle_offset(self, target_name: str) -> float:
-        return self.SAFE_Z_OFFSET if self._is_peg_target(target_name) else self.GRASP_Z_OFFSET
+        return self.SAFE_Z_OFFSET if self._is_release_destination(target_name) else self.GRASP_Z_OFFSET
+
+    def _get_board_center_position_w(self, env_id: int) -> torch.Tensor:
+        """Return the centre of the board at the controlled ring-release Z."""
+        center = _get_scene_entity_position_w(self.env, "peg_board", env_id).clone()
+        center[2] = self.Z_TABLE + self.env.scene.env_origins[env_id, 2]
+        return center
+
+    def _get_outside_position_w(self, region: str, env_id: int) -> torch.Tensor:
+        """Return a virtual Phase-4 release target outside the board."""
+        if region not in OUTSIDE_TARGETS:
+            raise ValueError(f"Unsupported outside region: {region!r}")
+        local_x, local_y = OUTSIDE_REGION_LOCAL_XY[region]
+        origin = self.env.scene.env_origins[env_id]
+        return origin + torch.tensor(
+            [local_x, local_y, self.Z_TABLE],
+            dtype=origin.dtype,
+            device=self.device,
+        )
 
     def _find_release_peg(
         self,
@@ -334,11 +418,16 @@ class SPARTANStateMachine:
         return count
 
     def _sync_peg_inventory(self, env_id: int, peg_name: str) -> None:
-        self.peg_inventory[peg_name][env_id] = self._count_rings_on_peg(env_id, peg_name)
+        if peg_name in self.peg_inventory:
+            self.peg_inventory[peg_name][env_id] = self._count_rings_on_peg(env_id, peg_name)
 
     def _is_top_ring_on_peg(self, ring_name: str, env_id: int) -> bool:
         peg_name = self.ring_support_peg[ring_name][env_id]
         if peg_name is None:
+            return True
+        if peg_name in OUTSIDE_TARGETS:
+            # Phase-4 regions contain separate planar slots, not vertical
+            # stacks. Every placed ring remains physically accessible.
             return True
         ring_level = int(self.ring_stack_level[ring_name][env_id].item())
         top_level: int | None = None
@@ -372,6 +461,14 @@ class SPARTANStateMachine:
     def ring_count_on_peg(self, env_id: int, peg_name: str) -> int:
         """Return the number of frozen rings on *peg_name* for *env_id*."""
         return self._count_rings_on_peg(env_id, peg_name)
+
+    def get_board_center_position_w(self, env_id: int) -> torch.Tensor:
+        """Return the phase-2 board-centre target in world coordinates."""
+        return self._get_board_center_position_w(env_id)
+
+    def get_outside_position_w(self, region: str, env_id: int) -> torch.Tensor:
+        """Return a public Phase-4 outside-region position."""
+        return self._get_outside_position_w(region, env_id)
 
     def get_top_rings_on_peg(
         self, env_id: int, peg_name: str, num_rings: int = 2
@@ -425,7 +522,7 @@ class SPARTANStateMachine:
                 return
 
         if verb == "release":
-            if target == "None" or not target.startswith("peg_"):
+            if target == "None" or not self._is_release_destination(target):
                 return
             attached_target = (
                 self.attached_target_r[env_id]
@@ -515,6 +612,11 @@ class SPARTANStateMachine:
         sign_arm = 1.0 if subject == "right_arm" else -1.0
         offset = torch.tensor([-0.005 * sign_arm, 0.0, 0.0], device=self.device)
 
+        if target_name == BOARD_CENTER:
+            return self._get_board_center_position_w(env_id) + offset
+        if target_name in OUTSIDE_TARGETS:
+            return self._get_outside_position_w(target_name, env_id) + offset
+
         cached_peg_pos = self._get_cached_peg_position_w(target_name, env_id)
         if cached_peg_pos is not None:
             return cached_peg_pos + offset
@@ -531,11 +633,13 @@ class SPARTANStateMachine:
         )
         return origin + torch.tensor([0.5, 0.0, 0.5], device=self.device)
 
-    def reset_env(self, env_id: int, phase: str = "phase_0") -> None:
-        """Reset the state machine for environment *env_id*.
+    def reset_control_state(self, env_id: int) -> None:
+        """Reset arm-command state while preserving the current ring state.
 
-        For ``phase_1``, all 4 rings are pre-frozen on ``peg_green`` in a
-        random stacking order (matching the evaluation initial condition).
+        This is used between phases of an end-to-end episode.  It deliberately
+        leaves the ring poses, frozen masks, stack levels, support pegs and peg
+        inventories untouched so the next phase starts from the state produced
+        by the preceding policy.
         """
         self.current_triplet_r[env_id] = None
         self.current_triplet_l[env_id] = None
@@ -553,10 +657,247 @@ class SPARTANStateMachine:
         self.release_target_l[env_id] = None
         self.release_committed_r[env_id] = False
         self.release_committed_l[env_id] = False
+        self.last_reach_failed_r[env_id] = False
+        self.last_reach_failed_l[env_id] = False
         self.target_pos_r[env_id] = torch.zeros(3, device=self.device)
         self.target_pos_l[env_id] = torch.zeros(3, device=self.device)
         self.current_gripper_state_r[env_id] = 1.0
         self.current_gripper_state_l[env_id] = 1.0
+
+    @staticmethod
+    def resolve_phase1_initial_state(initial_state: str) -> str:
+        """Resolve a Phase-1 curriculum state to one concrete layout."""
+        if initial_state not in PHASE1_INITIAL_STATES:
+            raise ValueError(
+                f"Unsupported Phase-1 initial state: {initial_state!r}; "
+                f"expected one of {PHASE1_INITIAL_STATES}"
+            )
+        if initial_state == "recovery_mixed":
+            return random.choice(("red3_blue1", "red1_blue3"))
+        if initial_state == "mixed_curriculum":
+            return random.choices(
+                (
+                    "stack_green",
+                    "red3_blue1",
+                    "red1_blue3",
+                    "red2_blue1_green1",
+                    "red1_blue2_green1",
+                ),
+                weights=(0.50, 0.125, 0.125, 0.125, 0.125),
+                k=1,
+            )[0]
+        return initial_state
+
+    @staticmethod
+    def build_phase1_initial_stacks(
+        initial_state: str = PHASE1_DEFAULT_INITIAL_STATE,
+        ring_order: list[str] | tuple[str, ...] | None = None,
+    ) -> dict[str, list[str]]:
+        """Return Phase-1 stacks in bottom-to-top order.
+
+        ``ring_order`` makes reset cases reproducible for exhaustive tests. If
+        omitted, all four ring identities are shuffled before allocation.
+        """
+        initial_state = SPARTANStateMachine.resolve_phase1_initial_state(initial_state)
+
+        rings = list(RING_NAMES if ring_order is None else ring_order)
+        if len(rings) != len(RING_NAMES) or set(rings) != set(RING_NAMES):
+            raise ValueError(
+                "Phase-1 ring_order must contain every ring exactly once"
+            )
+        if ring_order is None:
+            random.shuffle(rings)
+
+        if initial_state == "stack_green":
+            return {PEG_GREEN: rings}
+        if initial_state == "red3_blue1":
+            return {PEG_RED: rings[:3], PEG_BLUE: rings[3:]}
+        if initial_state == "red1_blue3":
+            return {PEG_RED: rings[:1], PEG_BLUE: rings[1:]}
+        if initial_state == "red2_blue1_green1":
+            return {
+                PEG_RED: rings[:2],
+                PEG_BLUE: rings[2:3],
+                PEG_GREEN: rings[3:],
+            }
+        return {
+            PEG_RED: rings[:1],
+            PEG_BLUE: rings[1:3],
+            PEG_GREEN: rings[3:],
+        }
+
+    def _place_frozen_stack(
+        self,
+        env_id: int,
+        peg_name: str,
+        ring_names: list[str],
+    ) -> None:
+        """Place ``ring_names`` on a peg in bottom-to-top order."""
+        if peg_name == BOARD_CENTER:
+            peg_pos_w = self._get_board_center_position_w(env_id)
+            ring_thickness = self.CENTER_RING_THICKNESS
+        elif peg_name in OUTSIDE_TARGETS:
+            peg_pos_w = self._get_outside_position_w(peg_name, env_id)
+            ring_thickness = self.CENTER_RING_THICKNESS
+        else:
+            peg_pos_w = self._get_cached_peg_position_w(peg_name, env_id)
+            if peg_pos_w is None:
+                peg_pos_w = _get_scene_entity_position_w(self.env, peg_name, env_id)
+            ring_thickness = self.RING_THICKNESS
+
+        for level, ring_name in enumerate(ring_names):
+            release_pos = peg_pos_w.clone()
+            if peg_name in OUTSIDE_TARGETS:
+                slot = level % len(OUTSIDE_SLOT_LATERAL_OFFSETS)
+                layer = level // len(OUTSIDE_SLOT_LATERAL_OFFSETS)
+                release_pos[1] += OUTSIDE_SLOT_LATERAL_OFFSETS[slot]
+                release_pos[2] += layer * ring_thickness
+            else:
+                release_pos[2] = (
+                    self.Z_TABLE
+                    + self.env.scene.env_origins[env_id, 2]
+                    + level * ring_thickness
+                )
+            self.frozen_rings_mask[ring_name][env_id] = True
+            self.frozen_rings_pose[ring_name][env_id, 0:3] = release_pos
+            self.frozen_rings_pose[ring_name][env_id, 3:7] = torch.tensor(
+                [1.0, 0.0, 0.0, 0.0], device=self.device
+            )
+            self.ring_support_peg[ring_name][env_id] = peg_name
+            self.ring_stack_level[ring_name][env_id] = level
+
+        self._sync_peg_inventory(env_id, peg_name)
+
+    @staticmethod
+    def resolve_phase2_initial_state(initial_state: str) -> str:
+        """Resolve the Phase-2 recovery mixture to one concrete layout."""
+        if initial_state not in PHASE2_INITIAL_STATES:
+            raise ValueError(
+                f"Unsupported Phase-2 initial state: {initial_state!r}; "
+                f"expected one of {PHASE2_INITIAL_STATES}"
+            )
+        if initial_state == "recovery_mixed":
+            return random.choice(("center2", "center3"))
+        return initial_state
+
+    @staticmethod
+    def build_phase2_initial_stacks(
+        initial_state: str = PHASE2_DEFAULT_INITIAL_STATE,
+        ring_order: list[str] | tuple[str, ...] | None = None,
+    ) -> dict[str, list[str]]:
+        """Return Phase-2 stacks in bottom-to-top order.
+
+        Recovery layouts are physically valid snapshots of the same task:
+        completed rings are stacked at board centre and every remaining ring
+        stays on a source peg.
+        """
+        initial_state = SPARTANStateMachine.resolve_phase2_initial_state(
+            initial_state
+        )
+        rings = list(RING_NAMES if ring_order is None else ring_order)
+        if len(rings) != len(RING_NAMES) or set(rings) != set(RING_NAMES):
+            raise ValueError(
+                "Phase-2 ring_order must contain every ring exactly once"
+            )
+        if ring_order is None:
+            random.shuffle(rings)
+
+        if initial_state == "red2_blue2":
+            return {PEG_RED: rings[:2], PEG_BLUE: rings[2:]}
+        if initial_state == "center2":
+            return {
+                PEG_RED: rings[:1],
+                PEG_BLUE: rings[1:2],
+                BOARD_CENTER: rings[2:],
+            }
+
+        # Randomising the remaining source makes center3 cover recovery with
+        # either arm rather than teaching a fixed final side.
+        source = random.choice((PEG_RED, PEG_BLUE))
+        return {source: rings[:1], BOARD_CENTER: rings[1:]}
+
+    @staticmethod
+    def build_phase3_initial_stacks(
+        initial_state: str = PHASE3_DEFAULT_INITIAL_STATE,
+        ring_order: list[str] | tuple[str, ...] | None = None,
+    ) -> dict[str, list[str]]:
+        """Return the canonical Phase-3 centre stack, bottom-to-top.
+
+        Phase 3 follows Phase 2 and therefore begins with all four rings at
+        the board centre.  Ring identities are deliberately shuffled because
+        the Phase-3 goal is invariant to ring colour.
+        """
+        if initial_state not in PHASE3_INITIAL_STATES:
+            raise ValueError(
+                f"Unsupported Phase-3 initial state: {initial_state!r}; "
+                f"expected one of {PHASE3_INITIAL_STATES}"
+            )
+        rings = list(RING_NAMES if ring_order is None else ring_order)
+        if len(rings) != len(RING_NAMES) or set(rings) != set(RING_NAMES):
+            raise ValueError(
+                "Phase-3 ring_order must contain every ring exactly once"
+            )
+        if ring_order is None:
+            random.shuffle(rings)
+        return {BOARD_CENTER: rings}
+
+    @staticmethod
+    def build_phase4_initial_stacks(
+        initial_state: str = PHASE4_DEFAULT_INITIAL_STATE,
+        ring_order: list[str] | tuple[str, ...] | None = None,
+    ) -> dict[str, list[str]]:
+        """Return the Phase-3 terminal layout used to start Phase 4."""
+        if initial_state not in PHASE4_INITIAL_STATES:
+            raise ValueError(
+                f"Unsupported Phase-4 initial state: {initial_state!r}; "
+                f"expected one of {PHASE4_INITIAL_STATES}"
+            )
+        rings = list(RING_NAMES if ring_order is None else ring_order)
+        if len(rings) != len(RING_NAMES) or set(rings) != set(RING_NAMES):
+            raise ValueError(
+                "Phase-4 ring_order must contain every ring exactly once"
+            )
+        if ring_order is None:
+            random.shuffle(rings)
+        return {
+            peg_name: [ring_name]
+            for peg_name, ring_name in zip(PEG_NAMES, rings)
+        }
+
+    def describe_phase1_layout(self, env_id: int) -> str:
+        """Serialize the current red/blue/green stacks for diagnostics."""
+        parts = []
+        for peg_name in (PEG_RED, PEG_BLUE, PEG_GREEN):
+            rings = [
+                (ring_name, int(self.ring_stack_level[ring_name][env_id].item()))
+                for ring_name in RING_NAMES
+                if self.ring_support_peg[ring_name][env_id] == peg_name
+            ]
+            rings.sort(key=lambda item: item[1])
+            parts.append(
+                f"{peg_name}=" + ",".join(ring_name for ring_name, _ in rings)
+            )
+        return ";".join(parts)
+
+    def reset_env(
+        self,
+        env_id: int,
+        phase: str = "phase_0",
+        phase1_initial_state: str = PHASE1_DEFAULT_INITIAL_STATE,
+        phase1_ring_order: list[str] | tuple[str, ...] | None = None,
+        phase2_initial_state: str = PHASE2_DEFAULT_INITIAL_STATE,
+        phase2_ring_order: list[str] | tuple[str, ...] | None = None,
+        phase3_initial_state: str = PHASE3_DEFAULT_INITIAL_STATE,
+        phase3_ring_order: list[str] | tuple[str, ...] | None = None,
+        phase4_initial_state: str = PHASE4_DEFAULT_INITIAL_STATE,
+        phase4_ring_order: list[str] | tuple[str, ...] | None = None,
+    ) -> None:
+        """Reset the state machine for environment *env_id*.
+
+        Phases 1--4 support explicit start layouts. Ring identities are
+        randomized unless an explicit per-phase order is supplied.
+        """
+        self.reset_control_state(env_id)
 
         for peg in self.peg_inventory:
             self.peg_inventory[peg][env_id] = 0
@@ -566,30 +907,74 @@ class SPARTANStateMachine:
             self._clear_ring_support(ring, env_id)
 
         if phase == "phase_1":
-            rings_to_stack = RING_NAMES.copy()
-            random.shuffle(rings_to_stack)
-            peg_pos_w = self._get_cached_peg_position_w(PEG_GREEN, env_id)
-            if peg_pos_w is None:
-                peg_pos_w = _get_scene_entity_position_w(self.env, PEG_GREEN, env_id)
+            resolved_initial_state = self.resolve_phase1_initial_state(
+                phase1_initial_state
+            )
+            self.last_phase1_initial_state[env_id] = resolved_initial_state
+            stacks = self.build_phase1_initial_stacks(
+                resolved_initial_state,
+                phase1_ring_order,
+            )
+            for peg_name, ring_names in stacks.items():
+                self._place_frozen_stack(env_id, peg_name, ring_names)
 
-            for idx, ring_name in enumerate(rings_to_stack):
-                release_pos = peg_pos_w.clone()
-                release_pos[2] = (
-                    self.Z_TABLE
-                    + self.env.scene.env_origins[env_id, 2]
-                    + idx * self.RING_THICKNESS
+        elif phase == "phase_2":
+            resolved_initial_state = self.resolve_phase2_initial_state(
+                phase2_initial_state
+            )
+            self.last_phase2_initial_state[env_id] = resolved_initial_state
+            stacks = self.build_phase2_initial_stacks(
+                resolved_initial_state,
+                phase2_ring_order,
+            )
+            for peg_name, ring_names in stacks.items():
+                self._place_frozen_stack(env_id, peg_name, ring_names)
+
+        elif phase == "phase_3":
+            if phase3_initial_state not in PHASE3_INITIAL_STATES:
+                raise ValueError(
+                    f"Unsupported Phase-3 initial state: {phase3_initial_state!r}"
                 )
-                self.frozen_rings_mask[ring_name][env_id] = True
-                self.frozen_rings_pose[ring_name][env_id, 0:3] = release_pos
-                self.frozen_rings_pose[ring_name][env_id, 3:7] = torch.tensor(
-                    [1.0, 0.0, 0.0, 0.0], device=self.device
+            self.last_phase3_initial_state[env_id] = phase3_initial_state
+            stacks = self.build_phase3_initial_stacks(
+                phase3_initial_state,
+                phase3_ring_order,
+            )
+            for peg_name, ring_names in stacks.items():
+                self._place_frozen_stack(env_id, peg_name, ring_names)
+
+        elif phase == "phase_4":
+            if phase4_initial_state not in PHASE4_INITIAL_STATES:
+                raise ValueError(
+                    f"Unsupported Phase-4 initial state: {phase4_initial_state!r}"
                 )
-                self.ring_support_peg[ring_name][env_id] = PEG_GREEN
-                self.ring_stack_level[ring_name][env_id] = idx
+            self.last_phase4_initial_state[env_id] = phase4_initial_state
+            stacks = self.build_phase4_initial_stacks(
+                phase4_initial_state,
+                phase4_ring_order,
+            )
+            for peg_name, ring_names in stacks.items():
+                self._place_frozen_stack(env_id, peg_name, ring_names)
 
-            self._sync_peg_inventory(env_id, PEG_GREEN)
-
-        print(f"[ENV {env_id}] Reset complete ({phase}).")
+        detail = (
+            f", initial_state={self.last_phase1_initial_state[env_id]}, "
+            f"layout={self.describe_phase1_layout(env_id)}"
+            if phase == "phase_1"
+            else (
+                f", initial_state={self.last_phase2_initial_state[env_id]}"
+                if phase == "phase_2"
+                else (
+                    f", initial_state={self.last_phase3_initial_state[env_id]}"
+                    if phase == "phase_3"
+                    else (
+                        f", initial_state={self.last_phase4_initial_state[env_id]}"
+                        if phase == "phase_4"
+                        else ""
+                    )
+                )
+            )
+        )
+        print(f"[ENV {env_id}] Reset complete ({phase}{detail}).")
 
     def green_peg_ring_count(self, env_id: int) -> int:
         """Convenience: count frozen rings on the green peg for *env_id*."""
@@ -604,12 +989,36 @@ class SPARTANStateMachine:
                 self.frozen_rings_mask[ring_name][env_id] for ring_name in RING_NAMES
             )
             return all_frozen and red_count == 2 and blue_count == 2
-        else:
+        if phase == "phase_2":
             return all(
                 self.frozen_rings_mask[ring_name][env_id]
-                and self.ring_support_peg[ring_name][env_id] == target_peg
+                and self.ring_support_peg[ring_name][env_id] == BOARD_CENTER
                 for ring_name in RING_NAMES
             )
+        if phase == "phase_3":
+            all_frozen = all(
+                self.frozen_rings_mask[ring_name][env_id]
+                for ring_name in RING_NAMES
+            )
+            return all_frozen and all(
+                self._count_rings_on_peg(env_id, peg_name) == 1
+                for peg_name in PEG_NAMES
+            )
+        if phase == "phase_4":
+            all_frozen = all(
+                self.frozen_rings_mask[ring_name][env_id]
+                for ring_name in RING_NAMES
+            )
+            return (
+                all_frozen
+                and self._count_rings_on_peg(env_id, OUTSIDE_RIGHT) == 2
+                and self._count_rings_on_peg(env_id, OUTSIDE_LEFT) == 2
+            )
+        return all(
+            self.frozen_rings_mask[ring_name][env_id]
+            and self.ring_support_peg[ring_name][env_id] == target_peg
+            for ring_name in RING_NAMES
+        )
 
     # -----------------------------------------------------------------------
     # Low-level arm logic
@@ -655,7 +1064,7 @@ class SPARTANStateMachine:
                 dest = target_pos[i] + torch.tensor([0.0, 0.0, self.SAFE_Z_OFFSET], device=self.device)
                 act[i, 0:3] = self._get_fixed_speed_cmd(tip[i], dest)
                 if self._tip_reached(tip[i], dest):
-                    if self._is_peg_target(target_name):
+                    if self._is_release_destination(target_name):
                         self._set_phase(sub_state, step_counter, i, "SETTLE")
                     else:
                         self._set_phase(sub_state, step_counter, i, "DESCEND")
@@ -679,6 +1088,10 @@ class SPARTANStateMachine:
                 act[i, 0:3] = self._get_fixed_speed_cmd(tip[i], dest)
                 if step_counter[i] > 15:
                     last_target[i] = target_name
+                    if subject == "right_arm":
+                        self.last_reach_failed_r[i] = False
+                    else:
+                        self.last_reach_failed_l[i] = False
                     self._finish_command(active_verb, sub_state, step_counter, i, current_triplet)
             elif phase == "RECOVER_TO_ENTRY":
                 dest = self._get_reach_entry_position(subject, i)
@@ -737,28 +1150,53 @@ class SPARTANStateMachine:
                     obj = attached_target[i]
                     if obj and obj != "None":
                         curr_pos = self.env.scene[obj].data.root_pos_w[i].clone()
-                        peg = self._find_release_peg(curr_pos, i, release_target[i])
+                        destination = release_target[i]
                         release_pos = curr_pos.clone()
 
-                        if peg:
-                            peg_pos = _get_scene_entity_position_w(self.env, peg, i).clone()
-                            num_rings = self._count_rings_on_peg(i, peg)
-                            release_pos[0:2] = peg_pos[0:2]
+                        if destination == BOARD_CENTER:
+                            center_pos = self._get_board_center_position_w(i)
+                            num_rings = self._count_rings_on_peg(i, BOARD_CENTER)
+                            release_pos[0:2] = center_pos[0:2]
                             release_pos[2] = (
-                                self.Z_TABLE
-                                + self.env.scene.env_origins[i, 2]
-                                + num_rings * self.RING_THICKNESS
+                                center_pos[2]
+                                + num_rings * self.CENTER_RING_THICKNESS
                             )
-                            self.ring_support_peg[obj][i] = peg
+                            self.ring_support_peg[obj][i] = BOARD_CENTER
                             self.ring_stack_level[obj][i] = num_rings
-                            self.peg_inventory[peg][i] = num_rings + 1
-                        else:
+                        elif destination in OUTSIDE_TARGETS:
+                            region_pos = self._get_outside_position_w(destination, i)
+                            num_rings = self._count_rings_on_peg(i, destination)
+                            slot = num_rings % len(OUTSIDE_SLOT_LATERAL_OFFSETS)
+                            layer = num_rings // len(OUTSIDE_SLOT_LATERAL_OFFSETS)
+                            release_pos[0:2] = region_pos[0:2]
+                            release_pos[1] += OUTSIDE_SLOT_LATERAL_OFFSETS[slot]
                             release_pos[2] = (
-                                self.Z_TABLE
-                                + self.env.scene.env_origins[i, 2]
-                                + self.BOARD_RELEASE_Z_OFFSET
+                                region_pos[2]
+                                + layer * self.CENTER_RING_THICKNESS
                             )
-                            self._clear_ring_support(obj, i)
+                            self.ring_support_peg[obj][i] = destination
+                            self.ring_stack_level[obj][i] = num_rings
+                        else:
+                            peg = self._find_release_peg(curr_pos, i, destination)
+                            if peg:
+                                peg_pos = _get_scene_entity_position_w(self.env, peg, i).clone()
+                                num_rings = self._count_rings_on_peg(i, peg)
+                                release_pos[0:2] = peg_pos[0:2]
+                                release_pos[2] = (
+                                    self.Z_TABLE
+                                    + self.env.scene.env_origins[i, 2]
+                                    + num_rings * self.RING_THICKNESS
+                                )
+                                self.ring_support_peg[obj][i] = peg
+                                self.ring_stack_level[obj][i] = num_rings
+                                self.peg_inventory[peg][i] = num_rings + 1
+                            else:
+                                release_pos[2] = (
+                                    self.Z_TABLE
+                                    + self.env.scene.env_origins[i, 2]
+                                    + self.BOARD_RELEASE_Z_OFFSET
+                                )
+                                self._clear_ring_support(obj, i)
 
                         self.frozen_rings_mask[obj][i] = True
                         self.frozen_rings_pose[obj][i, 0:3] = release_pos
@@ -770,6 +1208,28 @@ class SPARTANStateMachine:
 
                 if step_counter[i] > 20:
                     self._finish_command(active_verb, sub_state, step_counter, i, current_triplet)
+
+        elif verb == "park":
+            dest = self._get_reach_entry_position(subject, i)
+            act[i, 0:3] = self._get_fixed_speed_cmd(tip[i], dest)
+            if (
+                self._tip_reached(tip[i], dest)
+                or step_counter[i] >= self.REACH_RECOVERY_TIMEOUT_STEPS
+            ):
+                self._finish_command(
+                    active_verb, sub_state, step_counter, i, current_triplet
+                )
+
+        elif verb == "home":
+            dest = self._get_home_position(subject, i)
+            act[i, 0:3] = self._get_fixed_speed_cmd(tip[i], dest)
+            if (
+                self._tip_reached(tip[i], dest)
+                or step_counter[i] >= self.REACH_RECOVERY_TIMEOUT_STEPS
+            ):
+                self._finish_command(
+                    active_verb, sub_state, step_counter, i, current_triplet
+                )
 
         step_counter[i] += 1
 

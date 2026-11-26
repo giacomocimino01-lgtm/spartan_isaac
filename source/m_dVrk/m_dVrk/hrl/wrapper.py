@@ -32,6 +32,12 @@ from m_dVrk.hrl.constants import (
     TARGET_MAP,
     VERB_TO_ID,
     TARGET_TO_ID,
+    BOARD_CENTER,
+    OUTSIDE_LEFT,
+    OUTSIDE_RIGHT,
+    OUTSIDE_TARGETS,
+    target_name_for_phase,
+    target_id_for_phase,
     RING_NAMES,
     PEG_NAMES,
     RING_TARGETS,
@@ -53,7 +59,16 @@ from m_dVrk.hrl.constants import (
     SUCCESS_VIDEO_FRAME_SKIP,
     PEG_GREEN,
     PEG_RED,
+    PEG_YELLOW,
     PEG_BLUE,
+    PHASE1_DEFAULT_INITIAL_STATE,
+    PHASE1_INITIAL_STATES,
+    PHASE2_DEFAULT_INITIAL_STATE,
+    PHASE2_INITIAL_STATES,
+    PHASE3_DEFAULT_INITIAL_STATE,
+    PHASE3_INITIAL_STATES,
+    PHASE4_DEFAULT_INITIAL_STATE,
+    PHASE4_INITIAL_STATES,
 )
 from m_dVrk.hrl.observations import get_aux_obs, get_geom_obs, build_obs
 from m_dVrk.hrl.success import peg_ring_count, task_success
@@ -76,7 +91,7 @@ class DVRKVisionHRLWrapper(VecEnv):
         state_machine: ``SPARTANStateMachine`` initialised on the same env.
         tcc_model: Loaded ``XIRLResnet18`` in eval mode. Pass ``None`` to
             disable the TCC embedding (obs will be zeros in that region).
-        task_phase: ``"phase_0"`` or ``"phase_1"``.
+        task_phase: ``"phase_0"`` through ``"phase_4"``.
         reward_debug_dump_interval: How often (in steps) to dump reward
             debug images. Set to 0 to disable.
         reward_debug_dump_env_ids: Environment indices to dump images for.
@@ -104,11 +119,55 @@ class DVRKVisionHRLWrapper(VecEnv):
         success_dump_dir: str = SUCCESS_DUMP_DIR,
         success_video_dir: str = SUCCESS_VIDEO_DIR,
         success_video_frame_skip: int = SUCCESS_VIDEO_FRAME_SKIP,
+        auto_reset_on_success: bool = True,
+        discount_gamma: float = 0.99,
+        action_mask_mode: str = "guided",
+        manipulability_curriculum_scale: float = 1.0,
+        phase1_initial_state: str = PHASE1_DEFAULT_INITIAL_STATE,
+        phase1_ring_order: list[str] | tuple[str, ...] | None = None,
+        phase2_initial_state: str = PHASE2_DEFAULT_INITIAL_STATE,
+        phase2_ring_order: list[str] | tuple[str, ...] | None = None,
+        phase3_initial_state: str = PHASE3_DEFAULT_INITIAL_STATE,
+        phase3_ring_order: list[str] | tuple[str, ...] | None = None,
+        phase4_initial_state: str = PHASE4_DEFAULT_INITIAL_STATE,
+        phase4_ring_order: list[str] | tuple[str, ...] | None = None,
     ) -> None:
         self.env = isaac_env
         self.sm = state_machine
         self.tcc_model = tcc_model
         self.task_phase = task_phase
+        self.auto_reset_on_success = bool(auto_reset_on_success)
+        self.discount_gamma = float(discount_gamma)
+        if not 0.0 < self.discount_gamma <= 1.0:
+            raise ValueError("discount_gamma must be in (0, 1]")
+        if action_mask_mode not in {"guided", "goal_agnostic", "minimal"}:
+            raise ValueError(f"Unsupported action mask mode: {action_mask_mode}")
+        self.action_mask_mode = action_mask_mode
+        self.set_manipulability_curriculum_scale(manipulability_curriculum_scale)
+        if phase1_initial_state not in PHASE1_INITIAL_STATES:
+            raise ValueError(
+                f"Unsupported Phase-1 initial state: {phase1_initial_state!r}"
+            )
+        self.phase1_initial_state = phase1_initial_state
+        self.phase1_ring_order = phase1_ring_order
+        if phase2_initial_state not in PHASE2_INITIAL_STATES:
+            raise ValueError(
+                f"Unsupported Phase-2 initial state: {phase2_initial_state!r}"
+            )
+        self.phase2_initial_state = phase2_initial_state
+        self.phase2_ring_order = phase2_ring_order
+        if phase3_initial_state not in PHASE3_INITIAL_STATES:
+            raise ValueError(
+                f"Unsupported Phase-3 initial state: {phase3_initial_state!r}"
+            )
+        self.phase3_initial_state = phase3_initial_state
+        self.phase3_ring_order = phase3_ring_order
+        if phase4_initial_state not in PHASE4_INITIAL_STATES:
+            raise ValueError(
+                f"Unsupported Phase-4 initial state: {phase4_initial_state!r}"
+            )
+        self.phase4_initial_state = phase4_initial_state
+        self.phase4_ring_order = phase4_ring_order
 
         self.num_envs = isaac_env.num_envs
         self.stack_size = STACK_SIZE
@@ -168,6 +227,7 @@ class DVRKVisionHRLWrapper(VecEnv):
 
         # --- Action / embedding state ---
         self.prev_actions = IDLE_ACTION.to(self.env.device).unsqueeze(0).repeat(self.num_envs, 1)
+        self.last_step_actions = self.prev_actions.clone()
         self.last_override_flags = torch.zeros(
             (self.num_envs, 2), dtype=torch.float32, device=self.env.device
         )
@@ -178,13 +238,56 @@ class DVRKVisionHRLWrapper(VecEnv):
         )
         self.preprocess = T.Compose([T.Resize((112, 112), antialias=True)])
         self.current_step = torch.zeros(self.num_envs, dtype=torch.long, device=self.env.device)
+        self.phase_success_latched = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.env.device
+        )
+        self.episode_discounted_return = torch.zeros(
+            self.num_envs, dtype=torch.float32, device=self.env.device
+        )
+        self.episode_discount_multiplier = torch.ones(
+            self.num_envs, dtype=torch.float32, device=self.env.device
+        )
+        self.episode_invalid_commands = torch.zeros(
+            self.num_envs, dtype=torch.long, device=self.env.device
+        )
+        self.episode_bimanual_steps = torch.zeros(
+            self.num_envs, dtype=torch.long, device=self.env.device
+        )
+        self.episode_left_active_steps = torch.zeros(
+            self.num_envs, dtype=torch.long, device=self.env.device
+        )
+        self.episode_right_active_steps = torch.zeros(
+            self.num_envs, dtype=torch.long, device=self.env.device
+        )
+        self.episode_joint_action_changes = torch.zeros(
+            self.num_envs, dtype=torch.long, device=self.env.device
+        )
+        self.episode_free_arm_step_slots = torch.zeros(
+            self.num_envs, dtype=torch.long, device=self.env.device
+        )
         self.episode_ring_randomization_scale = np.full(
             self.num_envs,
             float(getattr(self.env, "ring_randomization_scale", 0.0)),
             dtype=np.float32,
         )
+        self.episode_phase_entry_pose_scale = np.full(
+            self.num_envs,
+            float(getattr(self.env, "phase_entry_pose_scale", 0.0)),
+            dtype=np.float32,
+        )
+        sampled_pose_scale = getattr(
+            self.env, "_phase_entry_pose_sampled_scale", None
+        )
+        self.episode_phase_entry_pose_sampled_scale = np.zeros(
+            self.num_envs, dtype=np.float32
+        )
+        if sampled_pose_scale is not None:
+            self.episode_phase_entry_pose_sampled_scale[:] = (
+                sampled_pose_scale.detach().cpu().numpy()
+            )
         self.goal_embedding = None
         self.actions = None
+        self.episode_initial_phase1_layout = [""] * self.num_envs
 
         # --- Robot tip indices ---
         _robot_r = self.env.scene["robot_right"]
@@ -201,6 +304,12 @@ class DVRKVisionHRLWrapper(VecEnv):
     # Initialisation helpers
     # -----------------------------------------------------------------------
 
+    def set_manipulability_curriculum_scale(self, value: float) -> None:
+        value = float(value)
+        if not 0.0 <= value <= 1.0:
+            raise ValueError("manipulability curriculum scale must be in [0, 1]")
+        self.manipulability_curriculum_scale = value
+
     def _cache_static_peg_positions_local(self) -> torch.Tensor:
         origins = self.env.scene.env_origins
         peg_pos_local = [
@@ -208,6 +317,120 @@ class DVRKVisionHRLWrapper(VecEnv):
             for name in self._peg_names
         ]
         return torch.stack(peg_pos_local, dim=1)  # (N, 4, 3)
+
+    def _empirical_full_state_selection(self, env_ids):
+        """Return enabled env ids and paired bank rows for full-state resets."""
+        if self.task_phase not in {"phase_2", "phase_4"}:
+            return None
+        cache = getattr(self.env, "_empirical_entry_bank", None)
+        sample_indices = getattr(
+            self.env, "_empirical_entry_indices", None
+        )
+        sample_enabled = getattr(
+            self.env, "_empirical_entry_enabled", None
+        )
+        if (
+            cache is None
+            or not cache.get("has_full_state", False)
+            or sample_indices is None
+            or sample_enabled is None
+        ):
+            return None
+
+        env_ids_t = torch.as_tensor(
+            list(env_ids), dtype=torch.long, device=self.env.device
+        )
+        if env_ids_t.numel() == 0:
+            return None
+        enabled = sample_enabled[env_ids_t]
+        if not bool(enabled.any().item()):
+            return None
+        selected_env_ids = env_ids_t[enabled]
+        selected_rows = sample_indices[selected_env_ids]
+        return cache, selected_env_ids, selected_rows
+
+    def _restore_empirical_ring_metadata(self, env_ids) -> None:
+        """Restore ring poses and symbolic support from the paired bank row.
+
+        ``reset_env`` normally constructs a new random Phase-4 permutation.
+        For an empirical full-state reset that would break the correlation
+        between the recorded arm configuration and the physical ring layout.
+        Replace that generated layout before the normal ring synchronisation.
+        """
+        selection = self._empirical_full_state_selection(env_ids)
+        if selection is None:
+            return
+        cache, selected_env_ids, selected_rows = selection
+
+        bank_ring_names = cache["ring_names"]
+        if set(bank_ring_names) != set(self._ring_names):
+            raise ValueError(
+                "Empirical full-state bank ring names do not match the scene"
+            )
+        bank_column = {name: idx for idx, name in enumerate(bank_ring_names)}
+
+        for env_id_t, row_t in zip(
+            selected_env_ids, selected_rows, strict=True
+        ):
+            env_id = int(env_id_t.item())
+            row = int(row_t.item())
+            for ring_name in self._ring_names:
+                col = bank_column[ring_name]
+                frozen = bool(cache["ring_frozen_mask"][row, col].item())
+                local_state = cache["ring_root_state_local"][row, col]
+                pose_w = local_state[0:7].clone()
+                pose_w[0:3] += self.env.scene.env_origins[env_id]
+
+                self.sm.frozen_rings_mask[ring_name][env_id] = frozen
+                if frozen:
+                    self.sm.frozen_rings_pose[ring_name][env_id] = pose_w
+                else:
+                    self.sm.frozen_rings_pose[ring_name][env_id].zero_()
+
+                support = str(cache["ring_support_peg"][row, col])
+                self.sm.ring_support_peg[ring_name][env_id] = (
+                    None if support == "None" else support
+                )
+                self.sm.ring_stack_level[ring_name][env_id] = int(
+                    cache["ring_stack_level"][row, col].item()
+                )
+
+            for peg_name in self.sm.peg_inventory:
+                self.sm._sync_peg_inventory(env_id, peg_name)
+
+            if cache.get("has_attachment_state", False):
+                attached_r = str(cache["attached_target_right"][row])
+                attached_l = str(cache["attached_target_left"][row])
+                self.sm.attached_target_r[env_id] = (
+                    None if attached_r in {"", "None"} else attached_r
+                )
+                self.sm.attached_target_l[env_id] = (
+                    None if attached_l in {"", "None"} else attached_l
+                )
+                self.sm.current_gripper_state_r[env_id] = (
+                    -1.0 if self.sm.attached_target_r[env_id] is not None else 1.0
+                )
+                self.sm.current_gripper_state_l[env_id] = (
+                    -1.0 if self.sm.attached_target_l[env_id] is not None else 1.0
+                )
+
+    def _restore_empirical_ring_velocities(self, env_ids) -> None:
+        """Restore the recorded ring velocities after frozen-ring syncing."""
+        selection = self._empirical_full_state_selection(env_ids)
+        if selection is None:
+            return
+        cache, selected_env_ids, selected_rows = selection
+        bank_column = {
+            name: idx for idx, name in enumerate(cache["ring_names"])
+        }
+        for ring_name in self._ring_names:
+            col = bank_column[ring_name]
+            velocities = cache["ring_root_state_local"][
+                selected_rows, col, 7:13
+            ]
+            self.env.scene[ring_name].write_root_velocity_to_sim(
+                velocities, env_ids=selected_env_ids
+            )
 
     def _sanitize_dump_env_ids(self, env_ids_spec) -> list[int]:
         env_ids = []
@@ -235,6 +458,7 @@ class DVRKVisionHRLWrapper(VecEnv):
             self.last_override_flags,
             self.num_envs,
             self.env.device,
+            self.task_phase,
         )
         geom_obs = get_geom_obs(
             self.env,
@@ -246,6 +470,8 @@ class DVRKVisionHRLWrapper(VecEnv):
             self._cached_peg_pos_local,
             self.task_phase,
             self.num_envs,
+            action_mask_mode=self.action_mask_mode,
+            manipulability_curriculum_scale=self.manipulability_curriculum_scale,
         )
         return build_obs(emb_obs, aux_obs, geom_obs, self.num_envs)
 
@@ -293,6 +519,62 @@ class DVRKVisionHRLWrapper(VecEnv):
             if raise_on_error:
                 raise
 
+    def transition_to_phase(
+        self,
+        task_phase: str,
+        tcc_model,
+        goal_embedding: torch.Tensor,
+    ) -> np.ndarray:
+        """Switch phase in place without resetting simulation or ring state.
+
+        The task phase is global to this vector wrapper, so all environments
+        transition together.  This method resets only policy/state-machine
+        bookkeeping and rebuilds the embedding stack with the new phase's TCC
+        encoder from the current camera frame.
+        """
+        if task_phase not in {"phase_0", "phase_1", "phase_2", "phase_3", "phase_4"}:
+            raise ValueError(f"Unsupported task phase: {task_phase}")
+        if tcc_model is None:
+            raise ValueError("A TCC model is required for an in-place phase transition")
+
+        goal_embedding = torch.as_tensor(
+            goal_embedding, dtype=torch.float32, device=self.env.device
+        )
+        if goal_embedding.shape != (self.emb_dim,):
+            raise ValueError(
+                f"Expected goal embedding shape ({self.emb_dim},), "
+                f"got {tuple(goal_embedding.shape)}"
+            )
+
+        self.task_phase = task_phase
+        self.tcc_model = tcc_model
+        self.goal_embedding = goal_embedding
+
+        for env_id in range(self.num_envs):
+            self.sm.reset_control_state(env_id)
+
+        self.current_step.zero_()
+        self.settle_steps_remaining.zero_()
+        self.phase_success_latched.zero_()
+        self.episode_invalid_commands.zero_()
+        self.episode_bimanual_steps.zero_()
+        self.episode_left_active_steps.zero_()
+        self.episode_right_active_steps.zero_()
+        self.episode_joint_action_changes.zero_()
+        self.episode_free_arm_step_slots.zero_()
+        self.prev_actions[:] = IDLE_ACTION.to(self.env.device).unsqueeze(0)
+        self.last_step_actions[:] = self.prev_actions
+        self.last_override_flags.zero_()
+
+        sync_attached_and_frozen_rings(
+            self.env,
+            self.sm,
+            torch.ones(self.num_envs, dtype=torch.bool, device=self.env.device),
+        )
+        init_emb = self._get_batched_embeddings()
+        self.emb_buffer[:] = init_emb.unsqueeze(1).repeat(1, self.stack_size, 1)
+        return self._get_obs()
+
     # -----------------------------------------------------------------------
     # Action sanitisation
     # -----------------------------------------------------------------------
@@ -331,14 +613,23 @@ class DVRKVisionHRLWrapper(VecEnv):
                 return "idle", "None", True
             current_peg = self.sm.ring_support_peg.get(target, [None] * self.num_envs)[env_id]
             if current_peg is not None and current_peg != "None":
-                top_rings = self.sm.get_top_rings_on_peg(env_id, current_peg, num_rings=1)
-                top_ring = top_rings[0] if top_rings else None
+                if current_peg in OUTSIDE_TARGETS:
+                    top_ring = target
+                else:
+                    top_rings = self.sm.get_top_rings_on_peg(
+                        env_id, current_peg, num_rings=1
+                    )
+                    top_ring = top_rings[0] if top_rings else None
                 if top_ring != target:
                     return "idle", "None", True
             return verb, target, False
 
         if verb == "release":
-            if target not in {t for t in TARGET_MAP.values() if t.startswith("peg_")}:
+            if target not in (
+                {t for t in TARGET_MAP.values() if t.startswith("peg_")}
+                | {BOARD_CENTER}
+                | set(OUTSIDE_TARGETS)
+            ):
                 return "idle", "None", True
             if attached_target is None:
                 return "idle", "None", True
@@ -352,23 +643,68 @@ class DVRKVisionHRLWrapper(VecEnv):
     # VecEnv interface
     # -----------------------------------------------------------------------
 
+    def _reset_state_machine_env(self, env_id: int) -> None:
+        self.sm.reset_env(
+            env_id,
+            phase=self.task_phase,
+            phase1_initial_state=self.phase1_initial_state,
+            phase1_ring_order=self.phase1_ring_order,
+            phase2_initial_state=self.phase2_initial_state,
+            phase2_ring_order=self.phase2_ring_order,
+            phase3_initial_state=self.phase3_initial_state,
+            phase3_ring_order=self.phase3_ring_order,
+            phase4_initial_state=self.phase4_initial_state,
+            phase4_ring_order=self.phase4_ring_order,
+        )
+        self.episode_initial_phase1_layout[env_id] = (
+            self.sm.describe_phase1_layout(env_id)
+            if self.task_phase == "phase_1"
+            else ""
+        )
+
     def reset(self) -> np.ndarray:
         self.env.reset()
         self.current_step[:] = 0
+        self.phase_success_latched.zero_()
+        self.episode_discounted_return.zero_()
+        self.episode_discount_multiplier.fill_(1.0)
+        self.episode_invalid_commands.zero_()
+        self.episode_bimanual_steps.zero_()
+        self.episode_left_active_steps.zero_()
+        self.episode_right_active_steps.zero_()
+        self.episode_joint_action_changes.zero_()
+        self.episode_free_arm_step_slots.zero_()
         self.episode_ring_randomization_scale.fill(
             float(getattr(self.env, "ring_randomization_scale", 0.0))
         )
+        self.episode_phase_entry_pose_scale.fill(
+            float(getattr(self.env, "phase_entry_pose_scale", 0.0))
+        )
+        sampled_pose_scale = getattr(
+            self.env, "_phase_entry_pose_sampled_scale", None
+        )
+        if sampled_pose_scale is None:
+            self.episode_phase_entry_pose_sampled_scale.fill(0.0)
+        else:
+            self.episode_phase_entry_pose_sampled_scale[:] = (
+                sampled_pose_scale.detach().cpu().numpy()
+            )
 
         for i in range(self.num_envs):
-            self.sm.reset_env(i, phase=self.task_phase)
+            self._reset_state_machine_env(i)
+
+        reset_env_ids = range(self.num_envs)
+        self._restore_empirical_ring_metadata(reset_env_ids)
 
         sync_attached_and_frozen_rings(
             self.env,
             self.sm,
             torch.ones(self.num_envs, dtype=torch.bool, device=self.env.device),
         )
+        self._restore_empirical_ring_velocities(reset_env_ids)
 
         self.prev_actions[:] = IDLE_ACTION.to(self.env.device).unsqueeze(0)
+        self.last_step_actions[:] = self.prev_actions
         self.last_override_flags.zero_()
 
         if self.tcc_model is not None:
@@ -384,6 +720,7 @@ class DVRKVisionHRLWrapper(VecEnv):
 
     def step_wait(self):
         actions = self.actions
+        previous_step_actions = self.last_step_actions.clone()
 
         sanitized_actions = torch.as_tensor(
             actions, dtype=torch.long, device=self.env.device
@@ -395,26 +732,38 @@ class DVRKVisionHRLWrapper(VecEnv):
         invalid_command_counts = torch.zeros(
             self.num_envs, dtype=torch.float32, device=self.env.device
         )
+        busy_left_before = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.env.device
+        )
+        busy_right_before = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.env.device
+        )
 
         for i in range(self.num_envs):
             was_busy_l = self.sm.sub_state_l[i] != "IDLE"
             was_busy_r = self.sm.sub_state_r[i] != "IDLE"
+            busy_left_before[i] = was_busy_l
+            busy_right_before[i] = was_busy_r
 
             old_cmd_l = self.sm.current_triplet_l[i]
             old_cmd_r = self.sm.current_triplet_r[i]
 
             verb_l = VERB_MAP[int(actions[i, 0])]
-            tgt_l  = TARGET_MAP[int(actions[i, 1])]
+            tgt_l  = target_name_for_phase(
+                int(actions[i, 1]), self.task_phase, verb_l
+            )
             verb_r = VERB_MAP[int(actions[i, 2])]
-            tgt_r  = TARGET_MAP[int(actions[i, 3])]
+            tgt_r  = target_name_for_phase(
+                int(actions[i, 3]), self.task_phase, verb_r
+            )
 
             verb_l, tgt_l, invalid_l = self._sanitize_arm_command(i, "left_arm", verb_l, tgt_l)
             verb_r, tgt_r, invalid_r = self._sanitize_arm_command(i, "right_arm", verb_r, tgt_r)
 
             sanitized_actions[i, 0] = VERB_TO_ID[verb_l]
-            sanitized_actions[i, 1] = TARGET_TO_ID[tgt_l]
+            sanitized_actions[i, 1] = target_id_for_phase(tgt_l, self.task_phase)
             sanitized_actions[i, 2] = VERB_TO_ID[verb_r]
-            sanitized_actions[i, 3] = TARGET_TO_ID[tgt_r]
+            sanitized_actions[i, 3] = target_id_for_phase(tgt_r, self.task_phase)
 
             new_cmd_l = {"verb": verb_l, "subject": "left_arm",  "target": tgt_l}
             new_cmd_r = {"verb": verb_r, "subject": "right_arm", "target": tgt_r}
@@ -430,17 +779,36 @@ class DVRKVisionHRLWrapper(VecEnv):
             # Keep prev_actions aligned with the command actually executing
             if was_busy_l and old_cmd_l is not None:
                 sanitized_actions[i, 0] = VERB_TO_ID.get(old_cmd_l["verb"], VERB_TO_ID["idle"])
-                sanitized_actions[i, 1] = TARGET_TO_ID.get(old_cmd_l["target"], TARGET_TO_ID["None"])
+                try:
+                    sanitized_actions[i, 1] = target_id_for_phase(old_cmd_l["target"], self.task_phase)
+                except KeyError:
+                    sanitized_actions[i, 1] = TARGET_TO_ID["None"]
             if was_busy_r and old_cmd_r is not None:
                 sanitized_actions[i, 2] = VERB_TO_ID.get(old_cmd_r["verb"], VERB_TO_ID["idle"])
-                sanitized_actions[i, 3] = TARGET_TO_ID.get(old_cmd_r["target"], TARGET_TO_ID["None"])
+                try:
+                    sanitized_actions[i, 3] = target_id_for_phase(old_cmd_r["target"], self.task_phase)
+                except KeyError:
+                    sanitized_actions[i, 3] = TARGET_TO_ID["None"]
 
             if not was_busy_l:
                 self.sm.set_new_triplet(verb_l, "left_arm",  tgt_l, i)
             if not was_busy_r:
                 self.sm.set_new_triplet(verb_r, "right_arm", tgt_r, i)
 
+        self.episode_invalid_commands += invalid_command_counts.to(torch.long)
+        self.episode_joint_action_changes += torch.any(
+            sanitized_actions != previous_step_actions, dim=1
+        ).to(torch.long)
+        self.episode_free_arm_step_slots += (
+            (~busy_left_before).to(torch.long)
+            + (~busy_right_before).to(torch.long)
+        )
+
         self.prev_actions = sanitized_actions
+        # Preserve the exact command executed on this transition even when a
+        # terminal reset clears ``prev_actions`` later in the same step. This
+        # keeps BC observation/action pairs correct for the final release.
+        self.last_step_actions = sanitized_actions.clone()
         self.last_override_flags = override_flags
 
         # --- Physics step ---
@@ -456,6 +824,19 @@ class DVRKVisionHRLWrapper(VecEnv):
         truncated_il  = truncated_il.to(device=self.env.device, dtype=torch.bool)
         isaac_done    = terminated_il | truncated_il
         active_env_mask = ~isaac_done
+        left_active = torch.tensor(
+            [self.sm.current_triplet_l[i] is not None for i in range(self.num_envs)],
+            dtype=torch.bool,
+            device=self.env.device,
+        )
+        right_active = torch.tensor(
+            [self.sm.current_triplet_r[i] is not None for i in range(self.num_envs)],
+            dtype=torch.bool,
+            device=self.env.device,
+        )
+        self.episode_left_active_steps += left_active.to(torch.long)
+        self.episode_right_active_steps += right_active.to(torch.long)
+        self.episode_bimanual_steps += (left_active & right_active).to(torch.long)
 
         # A timed-out reach returns to IDLE without setting last_target. Do not
         # expose that failed command as the previous successful reach, otherwise
@@ -463,13 +844,17 @@ class DVRKVisionHRLWrapper(VecEnv):
         for i in range(self.num_envs):
             if self.sm.sub_state_l[i] == "IDLE":
                 verb_l = VERB_MAP[int(self.prev_actions[i, 0].item())]
-                target_l = TARGET_MAP[int(self.prev_actions[i, 1].item())]
+                target_l = target_name_for_phase(
+                    int(self.prev_actions[i, 1].item()), self.task_phase, verb_l
+                )
                 if verb_l == "reach" and self.sm.last_target_l[i] != target_l:
                     self.prev_actions[i, 0] = VERB_TO_ID["idle"]
                     self.prev_actions[i, 1] = TARGET_TO_ID["None"]
             if self.sm.sub_state_r[i] == "IDLE":
                 verb_r = VERB_MAP[int(self.prev_actions[i, 2].item())]
-                target_r = TARGET_MAP[int(self.prev_actions[i, 3].item())]
+                target_r = target_name_for_phase(
+                    int(self.prev_actions[i, 3].item()), self.task_phase, verb_r
+                )
                 if verb_r == "reach" and self.sm.last_target_r[i] != target_r:
                     self.prev_actions[i, 2] = VERB_TO_ID["idle"]
                     self.prev_actions[i, 3] = TARGET_TO_ID["None"]
@@ -560,7 +945,9 @@ class DVRKVisionHRLWrapper(VecEnv):
         settling = self.settle_steps_remaining > 0
         self.settle_steps_remaining[settling] -= 1
         settled_success = rings_complete & (self.settle_steps_remaining == 0)
-        task_success_flag = settled_success | (rings_complete & isaac_done)
+        success_condition = settled_success | (rings_complete & isaac_done)
+        task_success_flag = success_condition & (~self.phase_success_latched)
+        self.phase_success_latched |= task_success_flag
 
         # --- Reward ---
         # The terminal bonus is tied to logical completion (all required rings
@@ -571,12 +958,21 @@ class DVRKVisionHRLWrapper(VecEnv):
             invalid_command_counts,
             success_mask=task_success_flag,
         )
+        self.episode_discounted_return += (
+            self.episode_discount_multiplier * rewards
+        )
+        self.episode_discount_multiplier *= self.discount_gamma
 
         if task_success_flag.any():
             self._maybe_dump_success_assets(task_success_flag, rgb_data)
 
         # --- Done flags ---
-        dones = isaac_done | task_success_flag
+        success_done = (
+            task_success_flag
+            if self.auto_reset_on_success
+            else torch.zeros_like(task_success_flag)
+        )
+        dones = isaac_done | success_done
         dones_numpy = dones.cpu().numpy()
 
         terminal_obs = self._get_obs()
@@ -590,23 +986,131 @@ class DVRKVisionHRLWrapper(VecEnv):
         terminated_np = terminated_il.cpu().numpy()
         truncated_np  = truncated_il.cpu().numpy()
 
-        for idx in dones.nonzero(as_tuple=False).flatten().tolist():
-            infos[idx]["terminal_observation"] = terminal_obs[idx].copy()
-            infos[idx]["TimeLimit.truncated"] = bool(truncated_np[idx] and not terminated_np[idx])
+        info_events = dones | task_success_flag
+        for idx in info_events.nonzero(as_tuple=False).flatten().tolist():
+            if dones[idx]:
+                infos[idx]["terminal_observation"] = terminal_obs[idx].copy()
+                infos[idx]["TimeLimit.truncated"] = bool(
+                    truncated_np[idx] and not terminated_np[idx]
+                )
+            infos[idx]["phase_success"]       = bool(task_success_flag[idx].item())
             infos[idx]["is_success"]          = bool(task_success_flag[idx].item())
             infos[idx]["rings_complete"]       = bool(rings_complete[idx].item())
             infos[idx]["terminal_distance"]    = float(rew_distance_raw[idx].item())
+            infos[idx]["discounted_episode_return"] = float(
+                self.episode_discounted_return[idx].item()
+            )
+            infos[idx]["episode_invalid_commands"] = int(
+                self.episode_invalid_commands[idx].item()
+            )
+            infos[idx]["episode_bimanual_steps"] = int(
+                self.episode_bimanual_steps[idx].item()
+            )
+            infos[idx]["episode_left_active_steps"] = int(
+                self.episode_left_active_steps[idx].item()
+            )
+            infos[idx]["episode_right_active_steps"] = int(
+                self.episode_right_active_steps[idx].item()
+            )
+            infos[idx]["episode_joint_action_changes"] = int(
+                self.episode_joint_action_changes[idx].item()
+            )
+            infos[idx]["episode_free_arm_step_slots"] = int(
+                self.episode_free_arm_step_slots[idx].item()
+            )
             infos[idx]["green_peg_ring_count"] = int(green_peg_ring_count[idx].item())
             infos[idx]["ring_randomization_scale"] = float(
                 self.episode_ring_randomization_scale[idx]
             )
+            infos[idx]["phase_entry_pose_scale"] = float(
+                self.episode_phase_entry_pose_scale[idx]
+            )
+            infos[idx]["phase_entry_pose_sampled_scale"] = float(
+                self.episode_phase_entry_pose_sampled_scale[idx]
+            )
+            empirical_indices = getattr(self.env, "_empirical_entry_indices", None)
+            empirical_enabled = getattr(self.env, "_empirical_entry_enabled", None)
+            if empirical_indices is not None and empirical_enabled is not None:
+                infos[idx]["empirical_entry_index"] = int(
+                    empirical_indices[idx].item()
+                )
+                infos[idx]["empirical_entry_enabled"] = bool(
+                    empirical_enabled[idx].item()
+                )
+                if self.task_phase == "phase_4":
+                    infos[idx]["phase4_empirical_entry_index"] = infos[idx][
+                        "empirical_entry_index"
+                    ]
+                    infos[idx]["phase4_empirical_entry_enabled"] = infos[idx][
+                        "empirical_entry_enabled"
+                    ]
             if self.task_phase == "phase_1":
+                infos[idx]["phase1_initial_state"] = self.phase1_initial_state
+                infos[idx]["phase1_resolved_initial_state"] = (
+                    self.sm.last_phase1_initial_state[idx]
+                )
+                infos[idx]["phase1_initial_layout"] = (
+                    self.episode_initial_phase1_layout[idx]
+                )
                 infos[idx]["red_peg_ring_count"]  = int(
                     peg_ring_count(self.sm, PEG_RED,  self._ring_names, self.num_envs, self.env.device)[idx].item()
                 )
                 infos[idx]["blue_peg_ring_count"] = int(
                     peg_ring_count(self.sm, PEG_BLUE, self._ring_names, self.num_envs, self.env.device)[idx].item()
                 )
+            elif self.task_phase == "phase_2":
+                infos[idx]["phase2_initial_state"] = self.phase2_initial_state
+                infos[idx]["phase2_resolved_initial_state"] = (
+                    self.sm.last_phase2_initial_state[idx]
+                )
+                infos[idx]["board_center_ring_count"] = int(
+                    peg_ring_count(
+                        self.sm,
+                        BOARD_CENTER,
+                        self._ring_names,
+                        self.num_envs,
+                        self.env.device,
+                    )[idx].item()
+                )
+            elif self.task_phase == "phase_3":
+                infos[idx]["phase3_initial_state"] = self.phase3_initial_state
+                infos[idx]["phase3_resolved_initial_state"] = (
+                    self.sm.last_phase3_initial_state[idx]
+                )
+                for peg_name, info_key in (
+                    (PEG_RED, "red_peg_ring_count"),
+                    (PEG_YELLOW, "yellow_peg_ring_count"),
+                    (PEG_GREEN, "green_peg_ring_count"),
+                    (PEG_BLUE, "blue_peg_ring_count"),
+                    (BOARD_CENTER, "board_center_ring_count"),
+                ):
+                    infos[idx][info_key] = int(
+                        peg_ring_count(
+                            self.sm,
+                            peg_name,
+                            self._ring_names,
+                            self.num_envs,
+                            self.env.device,
+                        )[idx].item()
+                    )
+            elif self.task_phase == "phase_4":
+                infos[idx]["phase4_initial_state"] = self.phase4_initial_state
+                infos[idx]["phase4_resolved_initial_state"] = (
+                    self.sm.last_phase4_initial_state[idx]
+                )
+                for region, info_key in (
+                    (OUTSIDE_RIGHT, "outside_right_ring_count"),
+                    (OUTSIDE_LEFT, "outside_left_ring_count"),
+                ):
+                    infos[idx][info_key] = int(
+                        peg_ring_count(
+                            self.sm,
+                            region,
+                            self._ring_names,
+                            self.num_envs,
+                            self.env.device,
+                        )[idx].item()
+                    )
 
         # --- Manual reset for non-Isaac terminal conditions ---
         manual_reset = dones & (~isaac_done)
@@ -622,10 +1126,30 @@ class DVRKVisionHRLWrapper(VecEnv):
                     f"[ENV {idx}] Episode done. "
                     f"Distance={rew_distance_raw[idx].item():.4f}. Resetting."
                 )
-                self.sm.reset_env(idx, phase=self.task_phase)
+                self._reset_state_machine_env(idx)
                 self.current_step[idx] = 0
+                self.phase_success_latched[idx] = False
+                self.episode_discounted_return[idx] = 0.0
+                self.episode_discount_multiplier[idx] = 1.0
+                self.episode_invalid_commands[idx] = 0
+                self.episode_bimanual_steps[idx] = 0
+                self.episode_left_active_steps[idx] = 0
+                self.episode_right_active_steps[idx] = 0
+                self.episode_joint_action_changes[idx] = 0
+                self.episode_free_arm_step_slots[idx] = 0
                 self.episode_ring_randomization_scale[idx] = float(
                     getattr(self.env, "ring_randomization_scale", 0.0)
+                )
+                self.episode_phase_entry_pose_scale[idx] = float(
+                    getattr(self.env, "phase_entry_pose_scale", 0.0)
+                )
+                sampled_pose_scale = getattr(
+                    self.env, "_phase_entry_pose_sampled_scale", None
+                )
+                self.episode_phase_entry_pose_sampled_scale[idx] = (
+                    float(sampled_pose_scale[idx].item())
+                    if sampled_pose_scale is not None
+                    else 0.0
                 )
                 self.settle_steps_remaining[idx] = 0
                 self.prev_actions[idx] = IDLE_ACTION.to(self.env.device)
@@ -633,10 +1157,13 @@ class DVRKVisionHRLWrapper(VecEnv):
                 self._success_frame_buffers[idx].clear()
                 self._ep_step_for_video[idx] = 0
 
+            self._restore_empirical_ring_metadata(done_ids)
+
             sync_mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self.env.device)
             for idx in done_ids:
                 sync_mask[idx] = True
             sync_attached_and_frozen_rings(self.env, self.sm, sync_mask)
+            self._restore_empirical_ring_velocities(done_ids)
 
             reset_embs = self._get_batched_embeddings()
             for idx in done_ids:

@@ -22,12 +22,17 @@ from m_dVrk.hrl.constants import (
     TARGET_MAP,
     VERB_TO_ID,
     TARGET_TO_ID,
+    BOARD_CENTER,
+    OUTSIDE_LEFT,
+    OUTSIDE_RIGHT,
+    OUTSIDE_TARGETS,
+    target_id_for_phase,
     IDLE_ACTION,
     AUX_DIM,
     GEOM_DIM,
     OBS_DIM,
 )
-from m_dVrk.hrl.constants import PEG_GREEN, PEG_RED, PEG_BLUE
+from m_dVrk.hrl.constants import PEG_GREEN, PEG_RED, PEG_BLUE, PEG_NAMES
 
 
 # ---------------------------------------------------------------------------
@@ -40,13 +45,15 @@ def get_manipulable_rings_mask(
     ring_names: list[str],
     task_phase: str,
     num_envs: int,
+    action_mask_mode: str = "guided",
+    manipulability_curriculum_scale: float = 1.0,
 ) -> torch.Tensor:
     """Return a ``(num_envs, 4)`` float mask: 1.0 if the ring can be picked.
 
     A ring is considered manipulable if:
       - it is not currently held by either arm, AND
-      - if it is on a peg: it is the topmost ring on that peg AND it has not
-        already been placed on the task's final peg, AND
+      - if it is on a peg: it is the topmost ring on that peg; in ``guided``
+        mode it must also not be on one of the task's final destinations, AND
       - if it is free in the workspace: it is within reach (z > -0.1,
         xy-radius < 0.45 m).
 
@@ -54,13 +61,18 @@ def get_manipulable_rings_mask(
         env: IsaacLab ``ManagerBasedRLEnv``.
         sm: ``SPARTANStateMachine`` instance.
         ring_names: Ordered list of ring entity names (length 4).
-        task_phase: ``"phase_0"`` or ``"phase_1"``.
+        task_phase: ``"phase_0"`` through ``"phase_4"``.
         num_envs: Number of parallel environments.
 
     Returns:
         Float tensor of shape ``(num_envs, 4)`` on ``env.device``.
     """
     from m_dVrk.controllers.ring_sync import get_scene_entity_positions_w
+
+    if action_mask_mode not in {"guided", "goal_agnostic", "minimal"}:
+        raise ValueError(f"Unsupported action mask mode: {action_mask_mode}")
+    if not 0.0 <= manipulability_curriculum_scale <= 1.0:
+        raise ValueError("manipulability_curriculum_scale must be in [0, 1]")
 
     device = env.device
     manipulable_mask = torch.zeros((num_envs, 4), dtype=torch.float32, device=device)
@@ -79,15 +91,43 @@ def get_manipulable_rings_mask(
                 placed_on_final_peg = (
                     (task_phase == "phase_0" and current_peg == PEG_GREEN)
                     or (task_phase == "phase_1" and current_peg in {PEG_RED, PEG_BLUE})
+                    or (task_phase == "phase_2" and current_peg == BOARD_CENTER)
+                    or (
+                        task_phase == "phase_3"
+                        and current_peg in PEG_NAMES
+                        and sm.ring_count_on_peg(env_i, current_peg) == 1
+                    )
+                    or (
+                        task_phase == "phase_4"
+                        and current_peg in OUTSIDE_TARGETS
+                    )
                 )
-                if sm.frozen_rings_mask[ring_name][env_i] and placed_on_final_peg:
+                if (
+                    action_mask_mode == "guided"
+                    and sm.frozen_rings_mask[ring_name][env_i]
+                    and placed_on_final_peg
+                ):
                     continue
 
                 # On a peg: manipulable only if it is the top ring
-                top_rings = sm.get_top_rings_on_peg(env_i, current_peg, num_rings=1)
-                top_ring = top_rings[0] if top_rings else None
+                if current_peg in OUTSIDE_TARGETS:
+                    top_ring = ring_name
+                else:
+                    top_rings = sm.get_top_rings_on_peg(
+                        env_i, current_peg, num_rings=1
+                    )
+                    top_ring = top_rings[0] if top_rings else None
                 if top_ring == ring_name:
-                    manipulable_mask[env_i, ring_idx] = 1.0
+                    if sm.frozen_rings_mask[ring_name][env_i] and placed_on_final_peg:
+                        # Under a minimal mask, gradually expose the observation
+                        # change that says a completed top ring may be corrected.
+                        # Scale 0 exactly matches the historical guided input;
+                        # scale 1 is the fully physical/minimal observation.
+                        manipulable_mask[env_i, ring_idx] = (
+                            manipulability_curriculum_scale
+                        )
+                    else:
+                        manipulable_mask[env_i, ring_idx] = 1.0
             else:
                 if sm.frozen_rings_mask[ring_name][env_i]:
                     continue
@@ -121,6 +161,7 @@ def _current_triplets_to_action_tensor(
     sm,
     num_envs: int,
     device: torch.device | str,
+    task_phase: str,
 ) -> torch.Tensor:
     """Encode the currently executing SPARTAN triplets as a ``(num_envs, 4)`` tensor."""
     out = IDLE_ACTION.to(device).unsqueeze(0).repeat(num_envs, 1)
@@ -129,12 +170,18 @@ def _current_triplets_to_action_tensor(
         if sm.sub_state_l[i] != "IDLE" and sm.current_triplet_l[i] is not None:
             cmd_l = sm.current_triplet_l[i]
             out[i, 0] = VERB_TO_ID.get(cmd_l["verb"], VERB_TO_ID["idle"])
-            out[i, 1] = TARGET_TO_ID.get(cmd_l["target"], TARGET_TO_ID["None"])
+            try:
+                out[i, 1] = target_id_for_phase(cmd_l["target"], task_phase)
+            except KeyError:
+                out[i, 1] = TARGET_TO_ID["None"]
 
         if sm.sub_state_r[i] != "IDLE" and sm.current_triplet_r[i] is not None:
             cmd_r = sm.current_triplet_r[i]
             out[i, 2] = VERB_TO_ID.get(cmd_r["verb"], VERB_TO_ID["idle"])
-            out[i, 3] = TARGET_TO_ID.get(cmd_r["target"], TARGET_TO_ID["None"])
+            try:
+                out[i, 3] = target_id_for_phase(cmd_r["target"], task_phase)
+            except KeyError:
+                out[i, 3] = TARGET_TO_ID["None"]
 
     return out
 
@@ -145,6 +192,7 @@ def get_aux_obs(
     last_override_flags: torch.Tensor,
     num_envs: int,
     device: torch.device | str,
+    task_phase: str = "phase_0",
 ) -> torch.Tensor:
     """Build the 62-dim auxiliary observation vector.
 
@@ -167,7 +215,9 @@ def get_aux_obs(
     Returns:
         Float tensor of shape ``(num_envs, 62)`` on *device*.
     """
-    current_triplet_actions = _current_triplets_to_action_tensor(sm, num_envs, device)
+    current_triplet_actions = _current_triplets_to_action_tensor(
+        sm, num_envs, device, task_phase
+    )
     current_triplet_oh = _actions_to_onehot(current_triplet_actions)
     prev_action_oh = _actions_to_onehot(prev_actions)
 
@@ -221,6 +271,8 @@ def get_geom_obs(
     cached_peg_pos_local: torch.Tensor,
     task_phase: str,
     num_envs: int,
+    action_mask_mode: str = "guided",
+    manipulability_curriculum_scale: float = 1.0,
 ) -> torch.Tensor:
     """Build the 86-dim geometric observation vector.
 
@@ -249,7 +301,7 @@ def get_geom_obs(
         tip_idx_l: Body index of the left PSM tool tip.
         cached_peg_pos_local: ``(num_envs, 4, 3)`` local peg positions
             (pre-cached at environment construction).
-        task_phase: ``"phase_0"`` or ``"phase_1"``.
+        task_phase: ``"phase_0"`` through ``"phase_4"``.
         num_envs: Number of parallel environments.
 
     Returns:
@@ -278,7 +330,43 @@ def get_geom_obs(
 
     rel_tip_r_to_rings = ring_pos_local - tip_r.unsqueeze(1)   # (N, 4, 3)
     rel_tip_l_to_rings = ring_pos_local - tip_l.unsqueeze(1)   # (N, 4, 3)
-    rel_ring_to_matching_peg = peg_pos_local - ring_pos_local  # (N, 4, 3)
+    if task_phase == "phase_2":
+        board_center_w = torch.stack(
+            [sm.get_board_center_position_w(i) for i in range(num_envs)], dim=0
+        )
+        board_center_local = board_center_w - origins
+        rel_ring_to_matching_peg = (
+            board_center_local.unsqueeze(1).expand(-1, len(ring_names), -1)
+            - ring_pos_local
+        )
+    elif task_phase == "phase_4":
+        outside_w = torch.stack(
+            [
+                torch.stack(
+                    [
+                        sm.get_outside_position_w(OUTSIDE_RIGHT, i),
+                        sm.get_outside_position_w(OUTSIDE_LEFT, i),
+                    ],
+                    dim=0,
+                )
+                for i in range(num_envs)
+            ],
+            dim=0,
+        )
+        outside_local = outside_w - origins.unsqueeze(1)
+        candidate_offsets = (
+            outside_local.unsqueeze(1) - ring_pos_local.unsqueeze(2)
+        )
+        nearest_region = torch.linalg.vector_norm(
+            candidate_offsets[:, :, :, :2], dim=-1
+        ).argmin(dim=2)
+        rel_ring_to_matching_peg = torch.gather(
+            candidate_offsets,
+            2,
+            nearest_region[:, :, None, None].expand(-1, -1, 1, 3),
+        ).squeeze(2)
+    else:
+        rel_ring_to_matching_peg = peg_pos_local - ring_pos_local  # (N, 4, 3)
 
     attached_r = torch.zeros((num_envs, 4), device=device)
     attached_l = torch.zeros((num_envs, 4), device=device)
@@ -292,12 +380,35 @@ def get_geom_obs(
         dim=1,
     )  # (N, 4)
 
-    inventory = torch.stack(
-        [sm.peg_inventory[name].float() for name in peg_names],
-        dim=1,
-    ) / 4.0  # (N, 4) normalised
+    if task_phase == "phase_4":
+        inventory = torch.tensor(
+            [
+                [
+                    sm.ring_count_on_peg(i, OUTSIDE_RIGHT),
+                    sm.ring_count_on_peg(i, OUTSIDE_LEFT),
+                    sum(sm.ring_count_on_peg(i, name) for name in peg_names),
+                    0,
+                ]
+                for i in range(num_envs)
+            ],
+            dtype=torch.float32,
+            device=device,
+        ) / 4.0
+    else:
+        inventory = torch.stack(
+            [sm.peg_inventory[name].float() for name in peg_names],
+            dim=1,
+        ) / 4.0  # (N, 4) normalised
 
-    manipulable_mask = get_manipulable_rings_mask(env, sm, ring_names, task_phase, num_envs)
+    manipulable_mask = get_manipulable_rings_mask(
+        env,
+        sm,
+        ring_names,
+        task_phase,
+        num_envs,
+        action_mask_mode=action_mask_mode,
+        manipulability_curriculum_scale=manipulability_curriculum_scale,
+    )
 
     geom = torch.cat(
         [

@@ -8,7 +8,16 @@ from __future__ import annotations
 
 import torch
 
-from m_dVrk.hrl.constants import RING_NAMES, PEG_GREEN, PEG_RED, PEG_BLUE
+from m_dVrk.hrl.constants import (
+    RING_NAMES,
+    PEG_NAMES,
+    BOARD_CENTER,
+    OUTSIDE_LEFT,
+    OUTSIDE_RIGHT,
+    PEG_GREEN,
+    PEG_RED,
+    PEG_BLUE,
+)
 
 
 def peg_ring_count(
@@ -53,10 +62,13 @@ def task_success(
     Phase 0 success: all 4 rings frozen on ``peg_green``.
     Phase 1 success: exactly 2 rings frozen on ``peg_red``, exactly 2 on
         ``peg_blue``, and all 4 rings frozen.
+    Phase 2 success: all 4 rings frozen at ``board_center``.
+    Phase 3 success: exactly one arbitrary ring on each coloured peg.
+    Phase 4 success: exactly two rings in each outside region.
 
     Args:
         sm: ``SPARTANStateMachine`` instance.
-        task_phase: ``"phase_0"`` or ``"phase_1"``.
+        task_phase: ``"phase_0"`` through ``"phase_3"``.
         ring_names: Ordered list of ring entity names.
         num_envs: Number of parallel environments.
         device: Tensor device.
@@ -72,5 +84,31 @@ def task_success(
             dim=1,
         ).all(dim=1)
         return all_frozen & (red_count == 2) & (blue_count == 2)
-    else:
-        return peg_ring_count(sm, PEG_GREEN, ring_names, num_envs, device) == 4
+    if task_phase == "phase_2":
+        return peg_ring_count(sm, BOARD_CENTER, ring_names, num_envs, device) == 4
+    if task_phase == "phase_3":
+        all_frozen = torch.stack(
+            [sm.frozen_rings_mask[name] for name in ring_names],
+            dim=1,
+        ).all(dim=1)
+        one_per_coloured_peg = torch.stack(
+            [
+                peg_ring_count(sm, peg_name, ring_names, num_envs, device) == 1
+                for peg_name in PEG_NAMES
+            ],
+            dim=1,
+        ).all(dim=1)
+        return all_frozen & one_per_coloured_peg
+    if task_phase == "phase_4":
+        all_frozen = torch.stack(
+            [sm.frozen_rings_mask[name] for name in ring_names],
+            dim=1,
+        ).all(dim=1)
+        right_count = peg_ring_count(
+            sm, OUTSIDE_RIGHT, ring_names, num_envs, device
+        )
+        left_count = peg_ring_count(
+            sm, OUTSIDE_LEFT, ring_names, num_envs, device
+        )
+        return all_frozen & (right_count == 2) & (left_count == 2)
+    return peg_ring_count(sm, PEG_GREEN, ring_names, num_envs, device) == 4
