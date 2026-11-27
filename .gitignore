@@ -64,9 +64,6 @@ _build
 # Teleop Recorded Dataset
 /datasets/
 
-# Tests
-tests/
-
 # Docker history
 .isaac-lab-docker-history
 
@@ -124,3 +121,12 @@ tests/
 /artifacts/logs
 /artifacts/videos
 /artifacts/snapshots
+
+# All experiment outputs are local. Keep only the placeholder in Git.
+/artifacts/**
+!/artifacts/.gitkeep
+
+# Documentation sources are versioned even though generated Markdown and text
+# files are ignored elsewhere by the legacy rules above.
+!/docs/**/*.md
+!/docs/**/*.txt
